@@ -9,6 +9,28 @@ import numpy as np
 from .config import LLM_URL, LLM_MODEL, FAST_LLM_MODEL, VISION_MODEL, VLM_HEF_PATH, get_system_prompt, get_current_context
 from .tts import add_pronunciation
 from .search import search_web, search_images
+
+def _internet_available(timeout_s: float = 1.5) -> bool:
+    """Cheap offline gate for voice-turn web search.
+
+    A dead DNS/route must never stall a conversation turn: one short UDP
+    connect (no traffic is actually sent for UDP) decides it.  Any failure
+    returns False so callers skip search and the LLM answers from its weights.
+    """
+    import socket
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(timeout_s)
+        s.connect(("1.1.1.1", 53))  # UDP: no handshake, just route/DNS reachability
+        s.close()
+        return True
+    except Exception:
+        return False
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
 from .timers import describe_duration, parse_timer_request
 
 logger = logging.getLogger(__name__)
@@ -621,8 +643,13 @@ class Brain:
             "what", "who", "when", "where", "find", "search", "tell me",
             "look up", "check", "is there", "did", "?",
         ]
-        has_realtime_kw = False  # Disabled pre-LLM web search for latency optimization
-        has_question = False
+        has_realtime_kw = any(kw in lower_text for kw in realtime_keywords)
+        has_question = any(m in lower_text for m in question_markers)
+        # Offline gate: never let a dead connection stall the turn.  If there is
+        # no route out, skip search entirely and let the LLM answer from weights.
+        if has_realtime_kw and has_question and not _internet_available():
+            print("[LLM] Offline — skipping web search.")
+            has_realtime_kw = False
         search_injected = False
         if has_realtime_kw and has_question:
             try:
@@ -856,8 +883,13 @@ class Brain:
             "what", "who", "when", "where", "find", "search", "tell me",
             "look up", "check", "is there", "did", "?",
         ]
-        has_realtime_kw = False  # Disabled pre-LLM web search for latency optimization
-        has_question = False
+        has_realtime_kw = any(kw in lower_text for kw in realtime_keywords)
+        has_question = any(m in lower_text for m in question_markers)
+        # Offline gate: never let a dead connection stall the turn.  If there is
+        # no route out, skip search entirely and let the LLM answer from weights.
+        if has_realtime_kw and has_question and not _internet_available():
+            print("[LLM] Offline — skipping web search.")
+            has_realtime_kw = False
         needs_search = has_realtime_kw and has_question
         search_injected = False
         if needs_search:
