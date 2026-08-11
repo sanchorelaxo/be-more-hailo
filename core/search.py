@@ -22,11 +22,13 @@ def search_web(query: str) -> str:
         
         try:
             import requests
-            # Using format v2 with 0 days (just today's detailed table)
-            url = f"https://wttr.in/{location}?format=v2&0"
+            # Compact one-line summary ("Sunny +23C 76% ...").  The v2 ASCII-art
+            # table is ~16 KB of box-drawing + ANSI colour that crashes
+            # hailo-ollama's strict JSON prompt renderer when injected upstream.
+            url = f"https://wttr.in/{location}?format=4"
             resp = requests.get(url, timeout=10)
             if resp.status_code == 200:
-                result = f"LIVE WEATHER DATA for {location}:\n{resp.text}"
+                result = f"LIVE WEATHER DATA for {location}: {resp.text.strip()}"
                 logger.info(f"Weather fetched from wttr.in: {location}")
                 return result
         except Exception as e:

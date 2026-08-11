@@ -657,6 +657,8 @@ class Brain:
                 if search_result and search_result not in ("SEARCH_EMPTY", "SEARCH_ERROR") and len(search_result) > 50:
                     # Strip the verbose "SEARCH RESULTS for '...':" header from search.py
                     clean_result = re.sub(r"^SEARCH RESULTS for '.*?':\n?", "", search_result).strip()
+                    # hailo-ollama 500s on non-ASCII from weather/news snippets.
+                    clean_result = clean_result.encode("ascii", "ignore").decode()
                     # Inject as a tight [LIVE DATA] block — clearer than the previous format
                     self.history[-1]["content"] = (
                         f"[LIVE DATA: {clean_result}] "
@@ -899,6 +901,8 @@ class Brain:
                 if search_result and search_result not in ("SEARCH_EMPTY", "SEARCH_ERROR") and len(search_result) > 50:
                     # Strip verbose "SEARCH RESULTS for '...':" prefix from search.py
                     clean_result = re.sub(r"^SEARCH RESULTS for '.*?':\n?", "", search_result).strip()
+                    # hailo-ollama 500s on non-ASCII from weather/news snippets.
+                    clean_result = clean_result.encode("ascii", "ignore").decode()
                     self.history[-1]["content"] = (
                         f"[LIVE DATA: {clean_result}] "
                         f"Using only the above live data, answer in one or two sentences as BMO: {user_text}"
