@@ -37,9 +37,12 @@ So the NPU budget is: **the LLM gets it.** Consequences:
   never think again. Set `BMO_NPU_STT=1` to enable it anyway (and accept that
   the LLM will stop working). CPU `whisper.cpp` with `ggml-base.en` is the
   default: ~2.7 s for a 3 s utterance, against ~22 s for `ggml-small.en`.
-- **The VLM borrows the NPU per photo** and releases it immediately afterwards,
-  paying ~3 s of init each time so the LLM survives. Photos are rare; thinking
-  is not.
+- **The VLM borrows the NPU per photo** and releases it immediately afterwards.
+  Since `hailo-ollama` never lets go on its own, `analyze_image` first asks it
+  to unload the LLM (`POST /api/generate` with `keep_alive: 0`, the Ollama
+  unload convention), then inits the VLM, then releases the device. The LLM
+  lazily reloads on the next chat turn (~5–10 s one-time cost). Photos are
+  rare; thinking is not.
 - If everything suddenly stops working, the driver is the first suspect — see
   [docs/MAINTENANCE.md](docs/MAINTENANCE.md).
 
@@ -141,7 +144,8 @@ unit-tested — verify those on the Pi. See [docs/MAINTENANCE.md](docs/MAINTENAN
 - **Persistent Chat History:** Conversations are saved to `memory.json` and reloaded on restart so BMO remembers previous exchanges.
 - **Web UI Refactor:** Fully responsive, mobile-friendly interface for interacting with BMO from any device.
 - **Improved Aliveness:** Interactive "Pondering" mode — BMO will periodically share fun facts, news, and quirky thoughts when idle.
-- **Enhanced Search:** BMO can now search for current news and regional information (Canada/Ontario prioritized).
+- **Enhanced Search:** BMO can search for current news and regional information (Canada/Ontario prioritized). Voice turns run web search for weather/forecast/temperature on any phrasing (no question marker needed) and for news/scores/prices on questions; a fast connectivity gate skips search entirely when offline so a dead network can never stall a turn.
+- **Reliable voice turns:** pre-warmed Piper is wired to audio before the first sentence (no more silent first answer), the mic stream stays drained during image/music flows so taps are always heard, and an action-only LLM reply now speaks a fallback line instead of silence.
 - **Audio Stability:** Fast nearest-neighbor resampling and improved ALSA contention handling for more reliable wake-word detection and voice recording.
 - **Desktop Ready:** Includes a `.desktop` launcher (`install.sh` creates it automatically).
 
@@ -356,7 +360,7 @@ If you have a Raspberry Pi Camera Module connected:
    ```
 3. Say something like "Hey BMO, take a photo and tell me what you see" — the agent captures a frame with `rpicam-still` and sends it to the vision model (`Qwen3-VL-2B-Instruct`) running natively on the NPU via the HailoRT Python API
 
-The VLM runs in the agent process, not the LLM server. The NPU cannot be shared (see *The NPU is single-tenant* above), so BMO acquires the device for the duration of one photo and releases it straight after, handing the NPU back to `hailo-ollama`. If the VLM HEF file isn't installed — or no camera is attached — BMO will politely say so rather than crashing.
+The VLM runs in the agent process, not the LLM server. The NPU cannot be shared (see *The NPU is single-tenant* above), so before each photo BMO asks `hailo-ollama` to unload the LLM, runs the VLM, then releases the device; the LLM reloads on the next chat turn. If the VLM HEF file isn't installed — or no camera is attached — BMO will politely say so rather than crashing.
 
 ---
 
@@ -469,12 +473,16 @@ Chat history is now persisted to `memory.json`. BMO will remember your previous 
 
 **Camera vision says "my eyes aren't working"**
 
-If the VLM HEF is present but inference still fails, check that `hailo_platform` is importable:
+This is the VLM's generic failure line. The most common cause was the NPU being held by `hailo-ollama` — fixed by having `analyze_image` unload the LLM first (see *The NPU is single-tenant*). If it still fails, check that `hailo_platform` is importable:
 ```bash
 source venv/bin/activate
 python3 -c "from hailo_platform.genai import VLM; print('OK')"
 ```
 If it fails, ensure system site-packages are enabled: `grep include-system venv/pyvenv.cfg` should say `true`.
+
+**Voice answers "Could not connect to my brain" on weather/news**
+
+The search result (e.g. the `wttr.in` v2 ASCII-art table) contained box-drawing Unicode / ANSI escapes that crash `hailo-ollama`'s strict JSON prompt renderer mid-request. Fixed: weather uses the compact one-line `wttr.in?format=4` summary and injected search data is ASCII-stripped. If you add a new search source, keep its output ASCII-only before it reaches the LLM.
 
 ---
 
