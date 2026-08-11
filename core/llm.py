@@ -44,6 +44,31 @@ def _release_vlm():
             logger.warning(f"VDevice release failed: {exc}")
         _vlm_vdevice = None
 
+def _unload_llm_from_npu(timeout_s: float = 15.0) -> bool:
+    """Ask hailo-ollama to unload the LLM so the VLM can claim /dev/hailo0.
+
+    The Hailo-10H is single-tenant and hailo-ollama holds an exclusive VDevice
+    for the LLM, so VLM init dies with HAILO_OUT_OF_PHYSICAL_DEVICES(74) while
+    the LLM is resident.  hailo-ollama implements the Ollama unload convention:
+    POST /api/generate with keep_alive=0 returns done_reason="unload" and frees
+    the device without stopping the service.  The LLM lazily reloads on the
+    next chat turn (~3-10 s one-time cost).
+    """
+    import requests
+    base = LLM_URL.split("/api/")[0]
+    try:
+        r = requests.post(
+            f"{base}/api/generate",
+            json={"model": LLM_MODEL, "keep_alive": 0},
+            timeout=timeout_s,
+        )
+        ok = r.ok and r.json().get("done_reason") == "unload"
+        logger.info("LLM unload for VLM: %s", "ok" if ok else r.text[:120])
+        return ok
+    except Exception as exc:
+        logger.warning(f"LLM unload request failed: {exc}")
+        return False
+
 
 def _get_vlm():
     """Return a (vlm, frame_shape, frame_dtype) tuple, initialising on first call."""
@@ -1019,6 +1044,11 @@ class Brain:
         assistant_appended = False
 
         try:
+            # Free the NPU: hailo-ollama holds /dev/hailo0 exclusively for the
+            # LLM; without this the VLM can never init (HAILO_OUT_OF_PHYSICAL_DEVICES).
+            _unload_llm_from_npu()
+            import time as _time
+            _time.sleep(0.5)  # let the driver finish releasing the device
             vlm, frame_shape, frame_dtype = _get_vlm()
 
             # Decode the base64 image into a numpy frame the VLM expects
