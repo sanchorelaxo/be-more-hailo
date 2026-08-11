@@ -175,22 +175,24 @@ def find_audio_devices():
     import sounddevice as sd
     devices = sd.query_devices()
     mic_idx = 1 # Default fallback
-    speaker_name = "plughw:UACDemoV10,0" # Default fallback
+    speaker_name = "plughw:CARD=UACDemoV10,DEV=0" # Default fallback (UACDemo speaker)
     
     # Preferred names for BMO hardware
-    pref_mic = "USB Audio Device"
-    pref_speaker = "UACDemoV10"
+    pref_mics = ("USB PnP Sound Device", "USB Audio Device")
+    pref_speakers = ("UACDemoV10", "USB PnP Sound Device")
     
     found_mic = False
     for i, dev in enumerate(devices):
         # Ensure the device actually has input channels before picking it
-        if pref_mic in dev['name'] and dev.get('max_input_channels', 0) > 0:
+        if any(m in dev['name'] for m in pref_mics) and dev.get('max_input_channels', 0) > 0:
             mic_idx = i
             found_mic = True
             print(f"[CONFIG] Found Mic by name: {dev['name']} at index {i}")
-        if pref_speaker in dev['name']:
-            speaker_name = "plughw:UACDemoV10,0"
-            print(f"[CONFIG] Found Speaker: {dev['name']} -> using {speaker_name}")
+        for m in pref_speakers:
+            if m in dev['name'] and dev.get('max_output_channels', 0) > 0:
+                speaker_name = 'plughw:CARD=' + m.replace(' ', '') + ',DEV=0'
+                print(f"[CONFIG] Found Speaker: {dev['name']} -> using {speaker_name}")
+                break
             
     # Fallback: if no mic found by name, pick the first one with input channels
     if not found_mic:

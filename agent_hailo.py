@@ -933,7 +933,14 @@ class BotGUI:
                             return True
 
                         if self.is_busy:
-                            time.sleep(0.5)
+                            # Keep draining the stream while a trigger flow runs:
+                            # if we sleep without reading, the ALSA ring buffer
+                            # overruns and stream.read() can wedge permanently,
+                            # leaving later manual_wake taps unheard.
+                            try:
+                                stream.read(CHUNK * downsample_factor)
+                            except Exception:
+                                pass
                             last_data_time = time.time() # Reset watchdog
                             continue
                             
@@ -1554,8 +1561,14 @@ class BotGUI:
         with self.speak_lock:
             try:
                 if not self.is_muted:
-                    # Lazily start the pipeline on the first sentence of a turn
-                    if self._piper_proc is None or self._piper_proc.poll() is not None:
+                    # Lazily start the pipeline on the first sentence of a turn.
+                    # A pre-warmed Piper (no reader thread / aplay yet) still needs
+                    # _start_tts_turn to wire up audio output — otherwise we write
+                    # to Piper's stdin and nobody ever plays it.
+                    pipeline_incomplete = (
+                        self._piper_reader_thread is None or self._tts_aplay is None
+                    )
+                    if self._piper_proc is None or self._piper_proc.poll() is not None or pipeline_incomplete:
                         self._start_tts_turn()
                         if self._piper_proc is None:
                             # Failed to start — skip audio, still transition state
@@ -1760,6 +1773,24 @@ class BotGUI:
                                     break
                         except StopIteration:
                             pass
+
+                    # If the model produced only an action (or nothing speakable),
+                    # BMO would stand silent while the user waits.  Detect the
+                    # no-speech case — full_response is empty or contains nothing
+                    # but JSON objects / emoji / punctuation — and say a fallback.
+                    from core.llm import extract_json_object as _extract
+                    _probe = full_response
+                    while True:
+                        _, _span = _extract(_probe)
+                        if _span is None:
+                            break
+                        _probe = (_probe[:_span[0]] + _probe[_span[1]:])
+                    from core.tts import clean_text_for_speech as _clean
+                    _speakable = _clean(_probe)
+                    if not any(c.isalnum() for c in _speakable):
+                        print("[LLM] Response contained no speakable text; using fallback line.")
+                        self.speak("Oh! BMO's tape deck got jammed on that one. Ask me again, friend?",
+                                   msg="Thinking...", end_of_turn=True)
 
                     image_url = self.current_image_url
                     taking_photo = self.taking_photo
