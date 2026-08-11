@@ -16,9 +16,19 @@ def search_web(query: str) -> str:
     
     # 0. Special Case: Weather
     if "weather" in query_lower:
-        location = "Brantford" # Default
-        if "in " in query_lower:
-            location = query_lower.split("in ")[1].split(",")[0].strip().replace(" ", "+")
+        # Extract the location by dropping the question/filler words, not by
+        # requiring the word "in" — "Weather Toronto" has no "in" and used to
+        # silently fall back to the default city.
+        location = "Brantford"  # Default
+        import re as _re
+        cand = query_lower
+        # Word-boundary removal so "the" doesn't mangle "weather" -> "wea r".
+        cand = _re.sub(r"\b(what's|what is|whats|tell me|the|weather|forecast|"
+                       r"like|today|tonight|tomorrow|please|in|at|for)\b", " ", cand)
+        cand = _re.sub(r"[?!.,]", " ", cand)
+        cand = " ".join(cand.split())  # collapse whitespace
+        if cand:
+            location = cand.replace(" ", "+")
         
         try:
             import requests

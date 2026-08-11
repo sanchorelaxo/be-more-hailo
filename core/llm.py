@@ -645,6 +645,10 @@ class Brain:
         ]
         has_realtime_kw = any(kw in lower_text for kw in realtime_keywords)
         has_question = any(m in lower_text for m in question_markers)
+        # Weather is a command, not a question: "Weather Toronto" carries no
+        # question marker but obviously needs live data.
+        if not has_question and any(w in lower_text for w in ("weather", "forecast", "temperature")):
+            has_question = True
         # Offline gate: never let a dead connection stall the turn.  If there is
         # no route out, skip search entirely and let the LLM answer from weights.
         if has_realtime_kw and has_question and not _internet_available():
@@ -887,6 +891,10 @@ class Brain:
         ]
         has_realtime_kw = any(kw in lower_text for kw in realtime_keywords)
         has_question = any(m in lower_text for m in question_markers)
+        # Weather is a command, not a question: "Weather Toronto" carries no
+        # question marker but obviously needs live data.
+        if not has_question and any(w in lower_text for w in ("weather", "forecast", "temperature")):
+            has_question = True
         # Offline gate: never let a dead connection stall the turn.  If there is
         # no route out, skip search entirely and let the LLM answer from weights.
         if has_realtime_kw and has_question and not _internet_available():
