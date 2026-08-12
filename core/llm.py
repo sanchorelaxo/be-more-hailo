@@ -58,11 +58,10 @@ def delegate_to_hermes(prompt: str) -> str:
         p = prompt.strip()
 
     cmd = [
-        "hermes", "chat", "-q", p,
-        "-Q",                       # quiet: only the final response
+        "hermes", "-z", p,          # global one-shot: prints ONLY the final response
         "-m", HERMES_DELEGATE_MODEL,
     ]
-    print(f"[HERMES] Delegating: hermes chat -q {shlex.quote(p[:60])}...")
+    print(f"[HERMES] Delegating: hermes -z {shlex.quote(p[:60])}...")
     try:
         proc = subprocess.run(
             cmd, capture_output=True, text=True, timeout=HERMES_DELEGATE_TIMEOUT
@@ -218,6 +217,10 @@ def _decode_image_to_frame(image_b64: str, target_shape, target_dtype=np.uint8):
 # Keep at most this many messages (plus the system prompt) to avoid
 # unbounded memory growth on memory-constrained devices like a Pi.
 MAX_HISTORY_MESSAGES = 20
+# Hard size cap on the non-system history sent to the LLM.  The Hailo-10H KV
+# cache overflows (stream dies with "Could not connect to my brain") well
+# before ~6k chars of history; keep it well inside a safe window.
+MAX_HISTORY_CHARS = 4000
 
 _DISPLAY_IMAGE_KEYWORDS = [
     "show me a picture", "show me an image", "show me a photo",
@@ -418,6 +421,10 @@ def strip_think_blocks(content: str) -> str:
 # break hailo-ollama's strict JSON prompt renderer.
 _ANSI_RE = re.compile(r'\x1b\[[0-9;]*[A-Za-z]')
 _CTRL_RE = re.compile(r'[\x00-\x1f\x7f]')
+# hailo-ollama's strict nlohmann/json renderer also rejects non-ASCII Unicode
+# (emojis, box-drawing, smart quotes) in message strings — they build up in
+# persistent history and crash every later request.  Drop them at the source.
+_NONASCII_RE = re.compile(r'[^\x00-\x7f]')
 
 
 def _sanitize_messages(messages: list) -> list:
@@ -435,6 +442,7 @@ def _sanitize_messages(messages: list) -> list:
         if isinstance(content, str):
             content = _ANSI_RE.sub(' ', content)
             content = _CTRL_RE.sub(' ', content)
+            content = _NONASCII_RE.sub(' ', content)
         result.append({**m, "content": content})
     return result
 
@@ -535,10 +543,21 @@ def extract_json_object(text: str):
 def _with_current_context(messages):
     """Return a shallow copy of `messages` with the current time/date prepended
     to the LAST user message. Keeps the system prompt byte-stable so the LLM's
-    prefix KV-cache can be reused across turns (saves 80–150 ms / turn)."""
+    prefix KV-cache can be reused across turns (saves 80–150 ms / turn).
+
+    Also enforces MAX_HISTORY_CHARS so the Hailo-10H's small KV cache can never
+    be overflowed by a verbose history (which otherwise kills the stream with
+    "Could not connect to my brain").  Drops oldest non-system messages first.
+    """
     if not messages:
         return messages
     out = list(messages)
+    # Cap total size of the non-system tail (keep system prompt + last 2).
+    if len(out) > 3:
+        tail = out[1:]
+        while len(tail) > 2 and sum(len(m.get("content", "")) for m in tail) > MAX_HISTORY_CHARS:
+            tail.pop(0)
+        out = [out[0]] + tail
     for i in range(len(out) - 1, -1, -1):
         if out[i].get("role") == "user":
             msg = dict(out[i])
@@ -621,11 +640,23 @@ class Brain:
             self.save_history(force=True)
 
     def _trim_history(self):
-        """Keep the system prompt + the most recent MAX_HISTORY_MESSAGES messages."""
+        """Keep the system prompt + a bounded recent window.
+
+        Bounds BOTH message count (MAX_HISTORY_MESSAGES) and total size
+        (MAX_HISTORY_CHARS).  The Hailo-10H KV cache is small — a single
+        over-long assistant reply (e.g. a verbose Hermes delegation) pushed
+        alongside the rest of history overflows it and hailo-ollama kills the
+        stream mid-generation ("Could not connect to my brain").  Longest
+        oldest messages are dropped first to protect the current turn.
+        """
         # history[0] is always the system prompt
         non_system = self.history[1:]
         if len(non_system) > MAX_HISTORY_MESSAGES:
-            self.history = [self.history[0]] + non_system[-MAX_HISTORY_MESSAGES:]
+            non_system = non_system[-MAX_HISTORY_MESSAGES:]
+        # Drop oldest while over the char budget (keep at least the last 2 msgs).
+        while len(non_system) > 2 and sum(len(m.get("content", "")) for m in non_system) > MAX_HISTORY_CHARS:
+            non_system.pop(0)
+        self.history = [self.history[0]] + non_system
         self.save_history()
 
     def think(self, user_text: str) -> str:
