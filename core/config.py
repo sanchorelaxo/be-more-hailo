@@ -16,6 +16,13 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LLM_URL = "http://127.0.0.1:8000/api/chat"
 LLM_MODEL = "qwen3:1.7b" # Native Hailo model for all queries
 FAST_LLM_MODEL = "qwen3:1.7b" # Unify models to prevent NPU swap crashing
+
+# "use hermes" delegation — shells out to the local `hermes chat` CLI (the
+# Raspberry Pi's own Hermes Agent instance) with a richer model than the tiny
+# on-NPU qwen3.  HERMES_DELEGATE_MODEL overrides; defaults to the Pi's current
+# hermes model.  HERMES_DELEGATE_TIMEOUT caps how long BMO waits (s).
+HERMES_DELEGATE_MODEL = os.environ.get("HERMES_DELEGATE_MODEL", "deepseek/deepseek-v4-flash-0731")
+HERMES_DELEGATE_TIMEOUT = int(os.environ.get("HERMES_DELEGATE_TIMEOUT", "180"))
 VISION_MODEL = "qwen2-vl-instruct:2b" # Legacy Ollama name (unused — VLM runs via HailoRT directly)
 
 # VLM (Vision Language Model) Settings — uses HailoRT Python API directly

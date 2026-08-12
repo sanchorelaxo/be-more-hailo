@@ -31,6 +31,66 @@ def _internet_available(timeout_s: float = 1.5) -> bool:
             s.close()
         except Exception:
             pass
+
+
+# Trigger phrase that hands the turn to the local Hermes Agent instance.
+HERMES_TRIGGERS = ("use hermes", "ask hermes", "hermes, ", "hermes:")
+
+
+def delegate_to_hermes(prompt: str) -> str:
+    """Run `hermes chat -q <prompt>` locally and return its answer.
+
+    Shells out to the Raspberry Pi's own Hermes Agent CLI (richer model + tools
+    than BMO's on-NPU qwen3).  Blocks until the delegated query finishes or
+    HERMES_DELEGATE_TIMEOUT elapses.  Returns a string BMO can speak; never
+    raises — any failure yields a graceful BMO-style apology so the turn
+    survives a missing CLI / hung process / offline API.
+    """
+    from .config import HERMES_DELEGATE_MODEL, HERMES_DELEGATE_TIMEOUT
+    import subprocess, shlex
+
+    # Strip our own trigger words from the prompt so Hermes sees the real ask.
+    p = prompt
+    for trig in HERMES_TRIGGERS:
+        p = re.sub(r"(?i)^\s*" + re.escape(trig), "", p)
+    p = p.strip().strip(":,")
+    if not p:
+        p = prompt.strip()
+
+    cmd = [
+        "hermes", "chat", "-q", p,
+        "-Q",                       # quiet: only the final response
+        "-m", HERMES_DELEGATE_MODEL,
+    ]
+    print(f"[HERMES] Delegating: hermes chat -q {shlex.quote(p[:60])}...")
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=HERMES_DELEGATE_TIMEOUT
+        )
+    except FileNotFoundError:
+        logger.warning("Hermes CLI not found — is Hermes Agent installed on this Pi?")
+        return "I tried to ask my big friend Hermes, but it isn't installed right now."
+    except subprocess.TimeoutExpired:
+        logger.warning(f"Hermes delegation timed out after {HERMES_DELEGATE_TIMEOUT}s.")
+        return "My big friend Hermes is taking too long to think. Try again later?"
+    except Exception as exc:
+        logger.warning(f"Hermes delegation error: {exc}")
+        return "My big friend Hermes hit a snag. Sorry, friend!"
+
+    out = proc.stdout.strip()
+    # Drop the trailing "session_id: ..." line that -Q appends to stdout.
+    out = re.sub(r"(?m)^session_id:\s*\S+\s*$", "", out).strip()
+    # Non-zero exit (CLI error, 404 model, auth failure, etc.) -> apologise.
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip()
+        logger.warning(f"Hermes CLI exited {proc.returncode}: {err[:200]}")
+        return "My big friend Hermes couldn't answer that one — it hit an error. Sorry, friend!"
+    if not out:
+        out = (proc.stderr or "").strip()
+    if not out:
+        out = "My big friend Hermes didn't say anything back."
+    print(f"[HERMES] Got {len(out)} chars from Hermes.")
+    return out
 from .timers import describe_duration, parse_timer_request
 
 logger = logging.getLogger(__name__)
@@ -579,6 +639,15 @@ class Brain:
 
         lower_text = user_text.lower()
 
+        # Pre-LLM Hermes delegation — same as stream_think
+        if any(t in lower_text for t in HERMES_TRIGGERS):
+            print("[HERMES] Trigger matched — delegating to local Hermes Agent.")
+            answer = delegate_to_hermes(user_text)
+            if answer:
+                self.history.append({"role": "assistant", "content": answer})
+                self.save_history()
+            return answer or ""
+
         # Pre-LLM camera check — same logic as stream_think
         camera_keywords = [
             "take a photo", "take a picture", "take photo", "take picture",
@@ -814,6 +883,18 @@ class Brain:
 
 
         lower_text = user_text.lower()
+
+        # Pre-LLM Hermes delegation: "use hermes ..." hands the turn to the
+        # Pi's own Hermes Agent CLI and speaks its answer.  Blocks (with a
+        # timeout) until the delegated query finishes — BMO waits.
+        if any(t in lower_text for t in HERMES_TRIGGERS):
+            print("[HERMES] Trigger matched — delegating to local Hermes Agent.")
+            answer = delegate_to_hermes(user_text)
+            if answer:
+                self.history.append({"role": "assistant", "content": answer})
+                self.save_history()
+                yield answer
+            return
 
         # Pre-LLM camera check: if user asks to take a photo / look at something,
         # emit the action JSON directly without calling the LLM.
