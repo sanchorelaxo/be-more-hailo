@@ -46,7 +46,7 @@ def delegate_to_hermes(prompt: str) -> str:
     raises — any failure yields a graceful BMO-style apology so the turn
     survives a missing CLI / hung process / offline API.
     """
-    from .config import HERMES_DELEGATE_MODEL, HERMES_DELEGATE_TIMEOUT
+    from .config import HERMES_DELEGATE_MODEL, HERMES_DELEGATE_TIMEOUT, HERMES_DELEGATE_SUCCINCT
     import subprocess, shlex
 
     # Strip our own trigger words from the prompt so Hermes sees the real ask.
@@ -56,6 +56,9 @@ def delegate_to_hermes(prompt: str) -> str:
     p = p.strip().strip(":,")
     if not p:
         p = prompt.strip()
+    # Keep the delegated response short (protects KV cache + shortens TTS).
+    if HERMES_DELEGATE_SUCCINCT:
+        p = f"{HERMES_DELEGATE_SUCCINCT} {p}"
 
     cmd = [
         "hermes", "-z", p,          # global one-shot: prints ONLY the final response

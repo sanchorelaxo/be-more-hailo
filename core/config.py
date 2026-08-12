@@ -23,6 +23,9 @@ FAST_LLM_MODEL = "qwen3:1.7b" # Unify models to prevent NPU swap crashing
 # hermes model.  HERMES_DELEGATE_TIMEOUT caps how long BMO waits (s).
 HERMES_DELEGATE_MODEL = os.environ.get("HERMES_DELEGATE_MODEL", "deepseek/deepseek-v4-flash-0731")
 HERMES_DELEGATE_TIMEOUT = int(os.environ.get("HERMES_DELEGATE_TIMEOUT", "180"))
+# Prepend this instruction to every delegated query.  Keeps one-shot responses
+# short (protects BMO's small KV cache and shortens TTS).  Set to "" to disable.
+HERMES_DELEGATE_SUCCINCT = os.environ.get("HERMES_DELEGATE_SUCCINCT", "Be ultra-succinct. Keep your answer to one or two short sentences.")
 VISION_MODEL = "qwen2-vl-instruct:2b" # Legacy Ollama name (unused — VLM runs via HailoRT directly)
 
 # VLM (Vision Language Model) Settings — uses HailoRT Python API directly
