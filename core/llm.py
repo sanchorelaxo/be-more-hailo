@@ -683,6 +683,41 @@ def _with_current_context(messages):
     return out
 
 
+_ACTION_ONLY_FALLBACK = "Okay friend!"
+
+
+def _history_safe(content: str) -> str:
+    """Return a history-safe assistant reply.
+
+    If the model answered with only a JSON action (e.g.
+    ``{"action": "set_expression", "value": "happy"}``) and no words, persisting
+    that bare JSON teaches it to answer every later turn with an action and no
+    speech — a self-reinforcing loop that surfaces as "tape deck got jammed".
+    (``_with_current_context`` trims history to system + last 2 messages, so the
+    immediately-preceding action-only turn is exactly what the model mimics.)
+    Substitute a benign spoken line so history always models "BMO speaks (and
+    maybe acts)".
+
+    Note: the action is still *executed* by the agent — this only affects the
+    persisted copy that shapes the next turn.
+    """
+    if not content:
+        return _ACTION_ONLY_FALLBACK
+    text = (strip_think_blocks(content) or content or "").strip()
+    if not text:
+        return _ACTION_ONLY_FALLBACK
+    # Peel off every balanced JSON object; anything alphanumeric left is speech.
+    probe = text
+    while True:
+        _, span = extract_json_object(probe)
+        if span is None:
+            break
+        probe = probe[:span[0]] + probe[span[1]:]
+    if not any(c.isalnum() for c in probe):
+        return _ACTION_ONLY_FALLBACK
+    return text
+
+
 class Brain:
     def __init__(self, persist: bool = True):
         """persist=False keeps this Brain off memory.json entirely.
@@ -1135,7 +1170,7 @@ class Brain:
                 if not content.strip():
                     content = "BMO is here! How can I help?"
 
-                self.history.append({"role": "assistant", "content": content})
+                self.history.append({"role": "assistant", "content": _history_safe(content)})
                 assistant_appended = True
 
                 # Clean injected search context from history so it doesn't
@@ -1441,7 +1476,7 @@ class Brain:
                         # For advanced tool use we won't yield the json action to TTS
                         pass
                     
-                    self.history.append({"role": "assistant", "content": strip_think_blocks(raw_content) or raw_content})
+                    self.history.append({"role": "assistant", "content": _history_safe(raw_content)})
                     assistant_appended = True
                     self.save_history()
 
@@ -1471,7 +1506,7 @@ class Brain:
             # either record what we got OR pop the dangling user message.
             if not assistant_appended:
                 if full_content.strip():
-                    salvaged = strip_think_blocks(full_content) or full_content
+                    salvaged = _history_safe(full_content)
                     self.history.append({"role": "assistant", "content": salvaged})
                 else:
                     # Drop the unmatched user message we appended at function start
