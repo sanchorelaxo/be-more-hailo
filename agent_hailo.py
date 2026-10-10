@@ -6,6 +6,7 @@
 import tkinter as tk
 from tkinter import ttk
 from PIL import Image, ImageTk, ImageOps, ImageDraw
+import queue
 import threading
 import time
 import json
@@ -38,7 +39,36 @@ from openwakeword.model import Model
 from core.llm import Brain, extract_json_object, strip_prompt_leakage, sanitize_messages
 from core.tts import play_audio_on_hardware
 from core.stt import transcribe_audio
-from core.config import MIC_DEVICE_INDEX, MIC_SAMPLE_RATE, WAKE_WORD_MODEL, WAKE_WORD_THRESHOLD, ALSA_DEVICE, VOLUME
+from core.endpoint import EndpointDetector
+from core.reminders import ReminderRegistry
+from core.volume import HardwareVolume, scaled_wav
+from core.camera import Camera, CameraError
+from core.presence import Presence
+from core.timer_chips import TimerChips
+from core.briefing.settings import load_briefing_settings, update_settings
+from core.briefing.scheduler import BriefingScheduler, prepare_briefing
+from core.briefing import ui as briefing_ui
+from core.config import LLM_KEEP_ALIVE, MIC_DEVICE_INDEX, MIC_SAMPLE_RATE, WAKE_WORD_MODEL, WAKE_WORD_THRESHOLD, ALSA_DEVICE, VOLUME
+
+# Live face rig (bmo_face/): morphs the artwork instead of flipping PNG frames.
+# Set BMO_FACE_RIG=0 to go back to the PNG faces; any load error does the same.
+try:
+    from bmo_face import SILENT as FACE_SILENT, LipSync, analyse_wav
+    from bmo_face.tk_face import FaceView
+    FACE_RIG_OK = True
+except Exception as _face_err:
+    print(f"[FACE] Rig unavailable, using PNG faces: {_face_err}")
+    FACE_RIG_OK = False
+USE_FACE_RIG = FACE_RIG_OK and os.environ.get("BMO_FACE_RIG", "1") != "0"
+FACE_FPS_ACTIVE = 30   # talking / listening
+FACE_FPS_CALM = 24     # everything else the rig draws
+WAV_LIPSYNC_DELAY = 0.05  # aplay start-up latency for pre-recorded clips
+# Mic buffer.  PortAudio's default (160 ms here) overflowed whenever the Tk
+# thread held the GIL a little too long, restarting the capture stream.
+MIC_LATENCY_S = 0.5
+# Footer caption's bottom edge (fraction of screen height).  At 0.92 the 32 px
+# label sat in y 410-442 and clipped open mouths (heart, shhh, error).
+STATUS_RELY = 0.97
 
 # =========================================================================
 # 1. HARDWARE CONFIGURATION
@@ -85,6 +115,60 @@ class BotStates:
     CURIOUS = "curious"
     LADYBUG = "ladybug"
     WORM = "worm"
+    BRIEFING = "briefing"  # morning briefing playing: small face + cards
+    GAME = "game"          # a touch game has the whole screen (core/games)
+
+# --briefing-now: (start, end) "HH:MM" window opened at start-up for testing.
+BRIEFING_NOW_WINDOW = None
+
+# Every face is drawn live by the rig, mapped to a rig expression
+# (bmo_face/expressions.json). SPEAKING uses the current talk mood instead
+# (see TALK_MOODS). The PNG frames in faces/ are only loaded if the rig fails.
+RIG_EXPRESSIONS = {
+    BotStates.IDLE: "idle",
+    BotStates.LISTENING: "listening",
+    BotStates.THINKING: "thinking",
+    BotStates.SPEAKING: None,
+    BotStates.WARMUP: "sleepy",
+    BotStates.ERROR: "error",
+    BotStates.CAPTURING: "capturing",
+    BotStates.HAPPY: "happy",
+    BotStates.SAD: "sad",
+    BotStates.ANGRY: "angry",
+    BotStates.SURPRISED: "surprised",
+    BotStates.SLEEPY: "sleepy",
+    BotStates.DIZZY: "dizzy",
+    BotStates.CHEEKY: "cheeky",
+    BotStates.HEART: "heart",
+    BotStates.STARRY_EYED: "starry",
+    BotStates.CONFUSED: "confused",
+    BotStates.SHHH: "shhh",
+    BotStates.JAMMING: "jamming",
+    BotStates.FOOTBALL: "football",
+    BotStates.DETECTIVE: "detective",
+    BotStates.SIR_MANO: "sir_mano",
+    BotStates.LOW_BATTERY: "low_battery",
+    BotStates.BEE: "bee",
+    BotStates.DAYDREAM: "daydream",
+    BotStates.BORED: "bored",
+    BotStates.CURIOUS: "curious",
+    BotStates.LADYBUG: "ladybug",
+    BotStates.WORM: "worm",
+    BotStates.BRIEFING: "happy",  # drawn in the briefing's talk mood (settings talk_mood)
+}
+
+# When the LLM sets an expression and then speaks, BMO talks in that mood:
+# the mouth follows the voice while the eyes, brows and extras stay (heart
+# eyes, stars, spirals...). Curious talks as surprised so the ring eyes don't
+# stare through a whole sentence; daydream talks without its butterfly.
+TALK_MOODS = {
+    BotStates.HAPPY: "happy", BotStates.HEART: "heart", BotStates.CHEEKY: "cheeky",
+    BotStates.STARRY_EYED: "starry", BotStates.JAMMING: "jamming", BotStates.FOOTBALL: "football",
+    BotStates.SAD: "sad", BotStates.ANGRY: "angry", BotStates.DIZZY: "dizzy",
+    BotStates.SURPRISED: "surprised", BotStates.CURIOUS: "surprised", BotStates.CONFUSED: "confused",
+    BotStates.SLEEPY: "sleepy", BotStates.LOW_BATTERY: "low_battery", BotStates.DAYDREAM: "relaxed",
+    BotStates.BORED: "bored",
+}
 
 class BotGUI:
 
@@ -137,8 +221,19 @@ class BotGUI:
         self.taking_photo = False
         self.current_image_url = None
         
+        # Pending timers/reminders (reminders.json); re-armed after the UI is up.
+        self.reminders = ReminderRegistry()
+        self.timer_chips = TimerChips(self.reminders)
+        # One owner for the camera: photos and (if enabled) presence detection.
+        self.camera = Camera()
+        self._arrival_nudged_on = None
+        self.game = None
+        self._game_sound = None
+        self._game_last_tap = 0.0
+
         # Memory
         self.brain = Brain()
+        threading.Thread(target=self.brain.warm_up, daemon=True).start()
         self.recent_thoughts = deque(maxlen=20)
         
         # Mood System
@@ -181,7 +276,7 @@ class BotGUI:
             relief='flat',
             highlightthickness=0
         )
-        self.status_label.place(relx=0.5, rely=0.92, anchor=tk.S)
+        self.status_label.place(relx=0.5, rely=STATUS_RELY, anchor=tk.S)
 
         self.is_muted = False
         self.mute_label = tk.Label(
@@ -199,9 +294,26 @@ class BotGUI:
         try:
             import json as _j
             with open("settings.json") as _f:
-                self.volume = float(_j.load(_f).get("volume", VOLUME))
+                _saved = _j.load(_f)
+            self.volume = float(_saved.get("volume", VOLUME))
         except Exception:
-            self.volume = VOLUME
+            _saved, self.volume = {}, VOLUME
+        # One volume control: when the speaker has a hardware mixer, BMO's
+        # slider drives it (the same control as the desktop slider) instead
+        # of scaling audio in software on top of it.  See core/volume.py.
+        self.hw_volume = HardwareVolume.for_device(ALSA_DEVICE)
+        self._hw_vol_pending = None
+        self._hw_vol_lock = threading.Lock()
+        if self.hw_volume is not None:
+            if _saved.get("volume_control") != "hardware":
+                # First run with hardware volume: carry the old BMO level over
+                # once, so BMO isn't suddenly louder than it was.
+                self.hw_volume.set(self.volume)
+                update_settings({"volume_control": "hardware"})
+            else:
+                hw = self.hw_volume.get()
+                self.volume = hw if hw is not None else self.volume
+            print(f"[VOLUME] Using {self.hw_volume.card} '{self.hw_volume.control}' mixer, at {self.volume:.0%}")
         self._volume_overlay = None
         self._volume_hide_job = None
 
@@ -233,12 +345,65 @@ class BotGUI:
         self._lip_sched = []      # list of (play_offset_seconds, mouth_open)
         self._lip_start = None    # wall-clock time the first audio chunk was queued
         self._lip_end = None      # play_offset of the most recent chunk
+
+        # Live face rig. Schedule entries become (play_offset, mouth_open, speech)
+        # where speech is the rig's lip-sync result; index 1 stays the legacy
+        # loudness so the PNG path keeps working unchanged.
+        self.face_view = None
+        self._lip_sync = None
+        self._rig_state = None
+        self._rig_speech = FACE_SILENT if FACE_RIG_OK else None
+        self._rig_frames = 0
+        self._talk_mood = "idle"
+        if USE_FACE_RIG:
+            try:
+                self.face_view = FaceView(self.background_label, size=(self.BG_WIDTH, self.BG_HEIGHT))
+                self._lip_sync = LipSync(22050)
+                print("[FACE] Live face rig enabled")
+            except Exception as e:
+                print(f"[FACE] Rig failed to start, using PNG faces: {e}")
+                self.face_view = None
+        # Morning briefing: the sun icon is drawn over the rig's frames while
+        # one is ready; BriefingView takes over the screen while it plays.
+        self.icon_overlay = briefing_ui.IconOverlay()
+        self._icon_label = None          # PNG-face fallback for the icon
+        if self.face_view is not None:
+            self.face_view.overlay = self._draw_overlays
+        self.briefing_view = None
+        self._briefing_photo = None
+        self._briefing_skip = threading.Event()
+        self._briefing_stop = threading.Event()
+        self._briefing_mood = "happy"
+        self._briefing_frame_ms = []     # draw + paste cost per frame, logged after each play
+        self.briefing_scheduler = BriefingScheduler(
+            settings_fn=self._briefing_settings,
+            prepare_fn=lambda now, s: prepare_briefing(now, s, self.reminders,
+                                                       fun_fact=self._briefing_fun_fact),
+            is_idle=self._briefing_can_show,
+            chime_fn=lambda: self.play_sound("briefing_sounds"),
+            on_icon=self._on_briefing_icon)
+        # "Good morning" only plays a briefing that's waiting; Brain asks here.
+        self.brain.briefing_ready = self.briefing_scheduler.is_ready_unplayed
+        self.brain.reminders = self.reminders
+        try:
+            from core.home_assistant import from_settings as _ha_from_settings
+            from core.briefing.settings import read_settings as _read_settings
+            self.brain.home = _ha_from_settings(_read_settings().get("home_assistant") or {})
+            if self.brain.home is not None:
+                print("[HOME] Home Assistant control enabled")
+        except Exception as e:
+            print(f"[HOME] Home Assistant disabled: {e}")
+
         self.load_animations()
         self.load_sounds()
         self.update_animation()
 
         # Start Main Thread
         threading.Thread(target=self.main_loop, daemon=True).start()
+        self._rearm_reminders()
+        threading.Thread(target=self._briefing_loop, daemon=True).start()
+        threading.Thread(target=self._presence_loop, daemon=True).start()
+        threading.Thread(target=self._alerts_loop, daemon=True).start()
 
         # Start Screensaver Audio Thread
         self.last_screensaver_audio_time = time.time()
@@ -277,6 +442,10 @@ class BotGUI:
             self.current_frame = 0
             self.last_state_change = time.time()
             print(f"[STATE] {state.upper()}: {msg}")
+        if state in TALK_MOODS:
+            self._talk_mood = TALK_MOODS[state]
+        elif state in (BotStates.IDLE, BotStates.LISTENING):
+            self._talk_mood = "idle"
         if msg:
             self.master.after(0, lambda: self.status_label.config(text=msg))
 
@@ -356,6 +525,17 @@ class BotGUI:
         """Map screen clicks to hot corners, mouth-tap mute, or tap-to-speak."""
         now = time.time()
 
+        # A game owns every tap (fast taps would otherwise trip the triple-tap
+        # exit); it has its own X button to leave.
+        game = getattr(self, "game", None)
+        if self.current_state == BotStates.GAME and game is not None:
+            w = self.master.winfo_width() or self.BG_WIDTH
+            h = self.master.winfo_height() or self.BG_HEIGHT
+            game.tap(int(event.x * self.BG_WIDTH / w), int(event.y * self.BG_HEIGHT / h), now)
+            self.last_user_interaction = now
+            self._game_last_tap = now
+            return
+
         # Triple-tap anywhere within 0.8 s → clean exit (useful without keyboard)
         self._triple_tap_times.append(now)
         self._triple_tap_times = [t for t in self._triple_tap_times if now - t <= 0.8]
@@ -377,6 +557,27 @@ class BotGUI:
         win_h = self.master.winfo_height()
         corner_w = win_w // 4
         corner_h = win_h // 4
+
+        # Morning briefing playing: these come before every other zone, or the
+        # mouth-tap mute zone would catch taps on the card.
+        if self.current_state == BotStates.BRIEFING:
+            if int(win_w * 0.30) <= x <= int(win_w * 0.70) and y < int(win_h * 0.15):
+                print(f"[CLICK] Top-Centre: Volume overlay ({x},{y})")
+                self.master.after(0, self._show_volume_overlay)
+            elif self.face_view is not None and x < win_w / 3:
+                print(f"[CLICK] Briefing: stop ({x},{y})")
+                self._briefing_stop.set()
+            else:
+                print(f"[CLICK] Briefing: skip ({x},{y})")
+                self._briefing_skip.set()
+            return
+
+        # The sun icon: checked before the top-right pondering corner and
+        # before a screensaver tap wakes BMO to listen.
+        if self.icon_overlay.visible and briefing_ui.icon_hit(x, y, win_w, win_h):
+            print(f"[CLICK] Briefing icon ({x},{y})")
+            self.start_briefing_from_tap()
+            return
 
         # Mouth zone: centre-lower portion of the face (where BMO's mouth lives)
         mouth_x0 = int(win_w * 0.27)
@@ -520,7 +721,41 @@ class BotGUI:
         ]
         return cv.create_polygon(pts, smooth=True, **kwargs)
 
+    def _software_gain(self) -> float:
+        """Gain BMO applies to its own audio: 1.0 when the hardware mixer
+        does the work, else the slider level (speakers without a mixer)."""
+        if getattr(self, "hw_volume", None) is not None:
+            return 1.0
+        return getattr(self, "volume", VOLUME)
+
+    def _apply_hw_volume(self):
+        """Push self.volume to the mixer off the Tk thread, coalescing a drag's
+        many events into whatever the latest level is."""
+        if getattr(self, "hw_volume", None) is None:
+            return
+        with self._hw_vol_lock:
+            start = self._hw_vol_pending is None
+            self._hw_vol_pending = self.volume
+        if not start:
+            return
+
+        def worker():
+            while True:
+                with self._hw_vol_lock:
+                    level = self._hw_vol_pending
+                self.hw_volume.set(level)
+                with self._hw_vol_lock:
+                    if self._hw_vol_pending == level:
+                        self._hw_vol_pending = None
+                        return
+        threading.Thread(target=worker, daemon=True).start()
+
     def _show_volume_overlay(self):
+        # The desktop slider moves the same mixer: show where it is now.
+        if getattr(self, "hw_volume", None) is not None and self._hw_vol_pending is None:
+            hw = self.hw_volume.get()
+            if hw is not None:
+                self.volume = hw
         if self._volume_overlay is None:
             self._create_volume_overlay()
         else:
@@ -555,6 +790,7 @@ class BotGUI:
         x0, x1 = self._vol_track_x0, self._vol_track_x1
         x = max(x0, min(x1, x))
         self.volume = (x - x0) / (x1 - x0)
+        self._apply_hw_volume()
         self._update_volume_visual()
 
     def _update_volume_visual(self):
@@ -565,8 +801,8 @@ class BotGUI:
         cy = ty + th // 2
         x  = x0 + self.volume * (x1 - x0)
 
-        # When the slider sits at 0 every audio path multiplies PCM by 0
-        # → silent output. That's a hard mute, so make it visually
+        # When the slider sits at 0 the speaker's mixer is switched off (or,
+        # without a mixer, every audio path multiplies PCM by 0) → silent. That's a hard mute, so make it visually
         # unmistakable: 🔇 icon, red knob, "MUTED" readout. Otherwise an
         # accidental drag-to-zero looks identical to a stuck app.
         muted = self.volume <= 0.001
@@ -605,9 +841,8 @@ class BotGUI:
     def _persist_volume(self):
         self._volume_save_job = None
         try:
-            import json as _j
-            with open("settings.json", "w") as _f:
-                _j.dump({"volume": self.volume}, _f)
+            # Merge, don't overwrite: settings.json also holds the briefing block.
+            update_settings({"volume": self.volume})
         except Exception:
             pass
 
@@ -663,6 +898,7 @@ class BotGUI:
             "greeting_sounds": [],
             "ack_sounds": [],
             "thinking_sounds": [],
+            "briefing_sounds": [],  # ready chime; not lip-synced (see play_sound)
             "music": []
         }
         base = "sounds"
@@ -688,11 +924,15 @@ class BotGUI:
                     time.sleep(0.08)
                 self.mouth_open = 0
 
-            proc = subprocess.Popen(['aplay', '-D', ALSA_DEVICE, '-q', '--buffer-time=500000', sound_file])
+            # Speakers without a hardware mixer: play a copy at the slider level.
+            play_path = scaled_wav(sound_file, self._software_gain())
+            proc = subprocess.Popen(['aplay', '-D', ALSA_DEVICE, '-q', '--buffer-time=500000', play_path])
             self.active_sounds.append(proc)
             
-            # Start mouth animation thread for this sound
-            if category in ["greeting_sounds", "thinking_sounds"]:
+            # Start mouth animation for this sound
+            if self.face_view is not None and category in ("greeting_sounds", "thinking_sounds", "ack_sounds"):
+                self._schedule_wav_lipsync(sound_file)
+            elif category in ["greeting_sounds", "thinking_sounds"]:
                 threading.Thread(target=animate_mouth_simple, args=(proc,), daemon=True).start()
             elif category == "music":
                 self.set_state(BotStates.JAMMING, "Jamming!")
@@ -707,6 +947,9 @@ class BotGUI:
                     except Exception: pass
                 if proc in self.active_sounds:
                     self.active_sounds.remove(proc)
+                if play_path != sound_file:
+                    try: os.remove(play_path)
+                    except OSError: pass
                 if category == "music" and self.current_state == BotStates.JAMMING:
                     self.set_state(BotStates.IDLE, "Tap to speak")
             threading.Thread(target=cleanup, daemon=True).start()
@@ -714,6 +957,78 @@ class BotGUI:
         except Exception as e:
             print(f"Error playing sound {sound_file}: {e}")
             return None
+
+    def _schedule_wav_lipsync(self, path):
+        """Lip-sync a pre-recorded clip that aplay has just started playing."""
+        try:
+            items, duration = analyse_wav(path)
+        except Exception as e:
+            print(f"[FACE] Could not analyse {path}: {e}")
+            return
+        with self._lip_lock:
+            self._lip_sched = items
+            self._lip_start = time.time() + WAV_LIPSYNC_DELAY
+            self._lip_end = duration
+
+    def _lip_speech(self, now):
+        """Rig lip-sync state for the audio playing right now."""
+        if self._lip_start is None:
+            self._rig_speech = FACE_SILENT
+            return self._rig_speech
+        elapsed = now - self._lip_start
+        latest, onset = None, False
+        with self._lip_lock:
+            sched = self._lip_sched
+            consumed = 0
+            while consumed < len(sched) and sched[consumed][0] <= elapsed:
+                entry = sched[consumed]
+                if len(entry) > 2 and entry[2] is not None:
+                    latest = entry[2]
+                    onset = onset or latest["onset"]
+                consumed += 1
+            if consumed:
+                del sched[:consumed]
+            lip_end = self._lip_end
+        if latest is not None:
+            self._rig_speech = {**latest, "onset": onset}
+        elif lip_end is not None and elapsed > lip_end + 0.15:
+            self._rig_speech = FACE_SILENT
+        else:
+            self._rig_speech = {**self._rig_speech, "onset": False}
+        return self._rig_speech
+
+    def _update_face_rig(self, display_state, now):
+        """Advance and draw the live rig. Returns the delay (ms) until the next tick."""
+        fv = self.face_view
+        if display_state == BotStates.SPEAKING:
+            want = self._talk_mood
+        elif display_state == BotStates.BRIEFING:
+            want = self._briefing_mood
+        else:
+            want = RIG_EXPRESSIONS[display_state]
+        if display_state != self._rig_state:
+            if self._rig_state == BotStates.WARMUP:
+                fv.rig.play_intro()  # eyes shut, then open with a stretch
+            fv.rig.set_expression(want)
+            self._rig_state = display_state
+        elif fv.rig.expr["name"] != want:
+            fv.rig.set_expression(want)  # talk mood changed mid-sentence
+        speech = self._lip_speech(now)
+        if display_state == BotStates.BRIEFING and self.briefing_view is not None:
+            t0 = time.perf_counter()
+            fv.photo.paste(self.briefing_view.tick(speech, now))
+            self._briefing_frame_ms.append((time.perf_counter() - t0) * 1000)
+        else:
+            fv.tick(speech, now)
+        # Re-point the label if a PNG frame or photo was shown in between.
+        if self.background_label.cget("image") != str(fv.photo):
+            fv.attach()
+        self._last_render_key = None  # make the PNG path redraw if we hand back
+        self._rig_frames += 1
+        if self._rig_frames == 300:
+            print(f"[FACE] Rig costs ~{fv.render_ms:.1f} ms/frame")
+        busy = speech["active"] or display_state in (BotStates.SPEAKING, BotStates.LISTENING, BotStates.BRIEFING)
+        return int(1000 / (FACE_FPS_ACTIVE if busy else FACE_FPS_CALM))
 
     # States needed before the GUI can be useful — loaded synchronously.
     CORE_ANIMATION_STATES = (
@@ -741,6 +1056,11 @@ class BotGUI:
     def load_animations(self):
         """Load core PNG frames synchronously; defer expressions to background."""
         self.animations = {}
+        if self.face_view is not None:
+            # The rig draws every face; PNGs load later only if it fails.
+            self.tk_img = None
+            print("[FACE] Rig draws every face; PNG frames not preloaded")
+            return
         for state in self.CORE_ANIMATION_STATES:
             frames = self._load_state_frames(state)
             if frames:
@@ -798,12 +1118,66 @@ class BotGUI:
                 self.screensaver_expr_until = now + self.screensaver_expr_dur
             display_state = self.screensaver_expr
 
-        # Hide text status label during screensaver
-        if self.current_state == BotStates.SCREENSAVER:
+        # Hide text status label during screensaver, the briefing and games
+        if self.current_state in (BotStates.SCREENSAVER, BotStates.BRIEFING, BotStates.GAME):
             if self.status_label.winfo_ismapped(): self.status_label.place_forget()
         else:
             if not self.status_label.winfo_ismapped():
-                self.status_label.place(relx=0.5, rely=0.92, anchor=tk.S)
+                self.status_label.place(relx=0.5, rely=STATUS_RELY, anchor=tk.S)
+
+        # A game draws the whole screen itself.
+        game = getattr(self, "game", None)
+        if display_state == BotStates.GAME and game is not None:
+            frame = game.frame(now)
+            for name in game.sounds():
+                if self._game_sound is not None:
+                    self._game_sound.play(name)
+            if self.face_view is not None:
+                self.face_view.photo.paste(frame)
+                photo = self.face_view.photo
+            else:
+                if self._briefing_photo is None:
+                    self._briefing_photo = ImageTk.PhotoImage(frame)
+                else:
+                    self._briefing_photo.paste(frame)
+                photo = self._briefing_photo
+            if self.background_label.cget("image") != str(photo):
+                self.background_label.config(image=photo)
+            self._rig_state = None            # re-set the face when the game ends
+            self._last_render_key = None
+            self.master.after(33, self.update_animation)
+            return
+
+        # Live face rig for the states it covers; everything else stays on PNGs.
+        if self.face_view is not None and display_state in RIG_EXPRESSIONS:
+            try:
+                delay = self._update_face_rig(display_state, now)
+                self.master.after(delay, self.update_animation)
+                return
+            except Exception as e:
+                print(f"[FACE] Rig error, falling back to PNG faces: {e}")
+                traceback.print_exc()
+                self.face_view = None
+                self._rig_state = None
+                self._last_render_key = None
+                if not self.animations:
+                    try:
+                        self.load_animations()
+                    except Exception as load_err:
+                        print(f"[FACE] Could not load PNG faces either: {load_err}")
+
+        # PNG faces: the briefing draws its cards full width, without a face.
+        if display_state == BotStates.BRIEFING and self.briefing_view is not None:
+            img = self.briefing_view.compose(None, now)
+            if self._briefing_photo is None:
+                self._briefing_photo = ImageTk.PhotoImage(img)
+            else:
+                self._briefing_photo.paste(img)
+            self.background_label.config(image=self._briefing_photo)
+            self._last_render_key = None
+            self.master.after(40, self.update_animation)
+            return
+        self._sync_icon_label()
 
         # Animation Loop
         frames = self.animations.get(display_state, self.animations.get(BotStates.IDLE, []))
@@ -920,46 +1294,51 @@ class BotGUI:
         print(f"[EARS] Waiting for wake word... (Index: {MIC_DEVICE_INDEX}, Rate: {capture_rate})")
         
         retry_count = 0
+        near_miss_at = 0.0
         while not self.stop_event.is_set():
             try:
-                # Use a smaller blocksize to reduce latency
-                with sd.InputStream(samplerate=capture_rate, device=MIC_DEVICE_INDEX, channels=1, dtype='int16', blocksize=CHUNK * downsample_factor) as stream:
+                # Callback capture into a queue, with a generous ALSA buffer.
+                # A blocking read() with the default 160 ms buffer overflowed about
+                # once a second (the Tk thread drawing the face holds the GIL), and
+                # each overflow restarts the stream: audio was dropped so the wake
+                # word arrived in fragments, and occasionally the C-Media mic never
+                # resumed after a restart, leaving BMO deaf until the next reopen.
+                frames_q = queue.Queue(maxsize=64)  # ~5 s of 80 ms chunks
+
+                def _on_audio(indata, frames, time_info, status, q=frames_q):
+                    try:
+                        q.put_nowait(indata.copy())
+                    except queue.Full:
+                        pass  # consumer is far behind; dropping beats blocking PortAudio
+
+                with sd.InputStream(samplerate=capture_rate, device=MIC_DEVICE_INDEX, channels=1, dtype='int16',
+                                    blocksize=CHUNK * downsample_factor, latency=MIC_LATENCY_S, callback=_on_audio):
                     retry_count = 0 # Reset on success
-                    last_data_time = time.time()
                     while not self.stop_event.is_set():
                         if self.manual_wake_event.is_set():
                             self.manual_wake_event.clear()
                             print("[EARS] Wake triggered via tap.")
                             return True
 
-                        if self.is_busy:
-                            # Keep draining the stream while a trigger flow runs:
-                            # if we sleep without reading, the ALSA ring buffer
-                            # overruns and stream.read() can wedge permanently,
-                            # leaving later manual_wake taps unheard.
-                            try:
-                                stream.read(CHUNK * downsample_factor)
-                            except Exception:
-                                pass
-                            last_data_time = time.time() # Reset watchdog
-                            continue
-                            
-                        data, overflowed = stream.read(CHUNK * downsample_factor)
-                        
-                        # Real failure modes: None / wrong-shape data
-                        if data is None or data.size == 0:
-                            if time.time() - last_data_time > 10.0:
-                                print("[EARS] Watchdog: Mic stream returned None/empty. Restarting...")
-                                break
-                            time.sleep(0.01)
-                            continue
+                        try:
+                            data = frames_q.get(timeout=2.0)
+                        except queue.Empty:
+                            # No audio for 2 s from a running stream: the mic has
+                            # stalled.  Reopen it rather than stay deaf.
+                            print("[EARS] Watchdog: no audio from the mic for 2 s. Reopening stream...")
+                            break
 
-                        last_data_time = time.time()  # Pet the watchdog (we got real data)
+                        if self.is_busy:
+                            continue  # keep draining so audio stays fresh; don't listen
 
                         # 1. Quick Volume Check (Skip OWW if it's too quiet)
                         # All-zero arrays are valid (quiet room) — don't treat as a mic failure.
                         current_max = np.max(np.abs(data))
-                        if current_max < 250: # Adjust threshold as needed
+                        # Only skip digital near-silence.  At 250 the quieter parts
+                        # of a distant "Hey BMO" were dropped (peaks ~600-800 with
+                        # the mic's AGC off), so the model heard fragments and
+                        # scored 0.1-0.2.  Running predict costs ~9% of one core.
+                        if current_max < 50:
                             continue
 
                         # 2. Down-sample 48 kHz → 16 kHz with an IIR low-pass
@@ -979,8 +1358,14 @@ class BotGUI:
                         
                         for key in oww.prediction_buffer.keys():
                             score = oww.prediction_buffer[key][-1]
+                            # Near misses explain "it didn't hear me" reports.
+                            if 0.1 <= score <= WAKE_WORD_THRESHOLD and time.time() - near_miss_at > 2.0:
+                                near_miss_at = time.time()
+                                print(f"[EARS] Near miss: {key} {score:.2f} (need > {WAKE_WORD_THRESHOLD}) "
+                                      f"state={self.current_state} peak={current_max}")
                             if score > WAKE_WORD_THRESHOLD:
-                                print(f"[EARS] Wake Word Detected: {key} (Score: {score:.2f})")
+                                print(f"[EARS] Wake Word Detected: {key} (Score: {score:.2f}) "
+                                      f"state={self.current_state} peak={current_max}")
                                 oww.reset()
                                 return True
             except Exception as e:
@@ -1004,36 +1389,30 @@ class BotGUI:
         print("Recording...")
         filename = "input.wav"
         frames = []
-        silent_chunks = 0
-        has_spoken = False
         total_samples = 0
         MAX_SAMPLES = MIC_SAMPLE_RATE * 15  # 15-second hard cap
+        endpoint = EndpointDetector(MIC_SAMPLE_RATE)
 
         def callback(indata, frames_count, time, status):
-            nonlocal silent_chunks, has_spoken, total_samples
-            vol = np.linalg.norm(indata)
+            nonlocal total_samples
+            rms = endpoint.feed(indata[:, 0])
             # Update mouth_open for real-time lip sync during recording (listening mode)
             if self.current_state == BotStates.LISTENING:
-                self.mouth_open = min(60, vol / 500)
+                self.mouth_open = min(60, max(0.0, rms - (endpoint.floor or rms)) / 15)
 
             frames.append(indata.copy())
             total_samples += indata.shape[0]
-            if vol < 500: # Silence threshold
-                silent_chunks += 1
-            else:
-                silent_chunks = 0
-                has_spoken = True
 
         retry_count = 0
         while retry_count < 3:
             try:
-                with sd.InputStream(samplerate=MIC_SAMPLE_RATE, device=MIC_DEVICE_INDEX, channels=1, dtype='int16', callback=callback):
+                with sd.InputStream(samplerate=MIC_SAMPLE_RATE, device=MIC_DEVICE_INDEX, channels=1, dtype='int16',
+                                    latency=MIC_LATENCY_S, callback=callback):
                     last_callback_samples = 0
                     last_callback_at = time.time()
                     while not self.stop_event.is_set():
                         sd.sleep(50)
-                        if not has_spoken and silent_chunks > 100: break
-                        if has_spoken and silent_chunks > 40: break
+                        if endpoint.done: break  # user stopped talking (or never started)
                         if total_samples >= MAX_SAMPLES: break  # 15-second hard cap (sample-accurate)
                         # Watchdog: if the callback stops firing mid-recording
                         # (USB unplug, driver crash) the polling loop would hang.
@@ -1054,6 +1433,11 @@ class BotGUI:
 
         self.mouth_open = 0 # Reset
         if not frames: return None
+        if not endpoint.has_spoken:
+            # Nothing but room noise: transcribing it only invents a question
+            # ("[Music]", "Subscribe to our channel...") for BMO to answer.
+            print("[REC] No speech detected — not transcribing.")
+            return None
         data = np.concatenate(frames, axis=0)
 
         # Down-sample 48 kHz → 16 kHz with a polyphase filter (better than the
@@ -1068,17 +1452,29 @@ class BotGUI:
         scipy.io.wavfile.write(filename, 16000, data_16k)
         return filename
     # --- TIMERS & REMINDERS ---
-    def start_timer_thread(self, minutes, message):
+    def start_timer_thread(self, minutes, message, reminder_id=None, kind="timer", name=None):
+        """Fire `message` in `minutes`.  The timer is saved in self.reminders
+        (so the morning briefing can list it and a reboot re-arms it) and
+        removed when it fires.  Pass `reminder_id` to re-arm a saved one."""
+        if reminder_id is None:
+            reminder_id = self.reminders.add(time.time() + minutes * 60, message, kind=kind, name=name)
+
         def timer_worker():
             print(f"[TIMER SET] for {minutes} minutes. Message: {message}")
             # Wait on stop_event so app shutdown drains the timer immediately.
+            # The saved entry stays, so the next start re-arms it.
             if self.stop_event.wait(timeout=minutes * 60):
                 print(f"[TIMER CANCELLED] (app shutting down): {message}")
                 return
+            if not self.reminders.remove(reminder_id):
+                print(f"[TIMER CANCELLED] (by voice): {message}")   # "cancel the pasta timer"
+                return
             print(f"[TIMER DONE] {message}")
-            
-            # Wait for BMO to finish speaking/listening to avoid ALSA conflicts
-            self._wait_until_idle({BotStates.SPEAKING, BotStates.LISTENING}, poll_s=1.0, timeout_s=120)
+
+            # Wait for BMO to finish speaking/listening (and any morning
+            # briefing) so the reminder doesn't fight it for the speaker.
+            self._wait_until_idle({BotStates.SPEAKING, BotStates.LISTENING, BotStates.BRIEFING},
+                                  poll_s=1.0, timeout_s=300)
                 
             # Interject the alarm
             old_state = self.current_state
@@ -1096,6 +1492,408 @@ class BotGUI:
                 self.set_state(old_state if old_state != BotStates.HAPPY else BotStates.IDLE, "Ready")
                 
         threading.Thread(target=timer_worker, daemon=True).start()
+
+    # --- MORNING BRIEFING ---
+    def _briefing_settings(self):
+        s = load_briefing_settings()
+        if BRIEFING_NOW_WINDOW:
+            # --briefing-now: a window open from start-up, every day, no lead time.
+            s.update(enabled=True, window=list(BRIEFING_NOW_WINDOW), prepare_minutes_before=0,
+                     days=["mon", "tue", "wed", "thu", "fri", "sat", "sun"])
+        return s
+
+    def _briefing_can_show(self):
+        """Icon and chime wait for BMO to be idle (they share the speaker)."""
+        return self.current_state in (BotStates.IDLE, BotStates.SCREENSAVER) and not self.is_busy
+
+    def _on_briefing_icon(self, visible):
+        if visible:
+            self.icon_overlay.show()
+        else:
+            self.icon_overlay.hide(fade=True)
+
+    def _draw_overlays(self, img, now):
+        """FaceView hook: running timers and the sun icon over BMO's face (and
+        over the screensaver)."""
+        chips = getattr(self, "timer_chips", None)
+        if chips is not None:
+            chips.apply(img, now)
+        return self.icon_overlay.apply(img, now)
+
+    def _sync_icon_label(self):
+        """PNG faces can't be drawn on, so the icon is a plain label there."""
+        want = self.icon_overlay.visible and self.current_state != BotStates.DISPLAY_IMAGE
+        if want and self._icon_label is None:
+            from core.briefing import cards
+            self._icon_photo = ImageTk.PhotoImage(cards.icon_sprite("ready"))
+            self._icon_label = tk.Label(self.master, image=self._icon_photo, bg='#C9E4C3',
+                                        borderwidth=0, highlightthickness=0)
+            # The label swallows its own taps (its event.x is label-relative).
+            self._icon_label.bind('<Button-1>', lambda e: (self.start_briefing_from_tap(), "break")[1])
+        if self._icon_label is not None:
+            if want and not self._icon_label.winfo_ismapped():
+                self._icon_label.place(relx=740 / 800, rely=60 / 480, anchor=tk.CENTER)
+            elif not want and self._icon_label.winfo_ismapped():
+                self._icon_label.place_forget()
+
+    def _briefing_loop(self):
+        """Tick the briefing's day every 30 s (prepare, icon + chime, fade)."""
+        while not self.stop_event.is_set():
+            try:
+                self.briefing_scheduler.tick()
+            except Exception as e:
+                print(f"[BRIEFING] Scheduler error: {e}")
+                traceback.print_exc()
+            if self.stop_event.wait(timeout=30):
+                break
+
+    def start_briefing_from_tap(self):
+        """Tap on the sun icon: play, or wiggle if BMO is busy."""
+        if self.current_state in (BotStates.LISTENING, BotStates.THINKING, BotStates.SPEAKING) \
+                or not self._try_claim_busy():
+            self.icon_overlay.wiggle()
+            return
+        briefing = self.briefing_scheduler.briefing_for_today()
+        if briefing is None:
+            self._release_busy()
+            self.icon_overlay.wiggle()
+            return
+        self.icon_overlay.press()
+        threading.Thread(target=self._play_briefing, args=(briefing,), daemon=True).start()
+
+    def _briefing_fun_fact(self):
+        """extras.fun_fact: one fact for the sign-off, made the way pondering
+        makes its thoughts (web search + the LLM, which only phrases it)."""
+        from core.search import search_web
+        found = search_web("interesting fun fact of the day")
+        if not found or found in ("SEARCH_EMPTY", "SEARCH_ERROR"):
+            return None
+        return self.generate_thought_internal(found)
+
+    def _wait_for_speaker(self, timeout_s=3.0):
+        """Wait for BMO's own sounds (reply TTS, thinking sound, effects) to let
+        go of the speaker: only one aplay can hold the ALSA device.  A voice
+        request ends its turn with the thinking sound still stopping."""
+        end = time.monotonic() + timeout_s
+        while time.monotonic() < end:
+            procs = [self._tts_aplay, self.thinking_audio_process] + list(self.active_sounds)
+            if all(p is None or p.poll() is not None for p in procs):
+                return True
+            time.sleep(0.05)
+        print("[BRIEFING] Speaker still busy after 3 s; trying anyway")
+        return False
+
+    def _start_part_audio(self, play_path, on_start=None, attempts=5):
+        """aplay one part, retrying while the device is busy ("audio open
+        error: Device or resource busy" exits within a moment).  Returns
+        (proc, started_at) or (None, None) on skip/stop or repeated failure."""
+        for attempt in range(attempts):
+            if self._briefing_skip.is_set() or self._briefing_stop.is_set():
+                return None, None
+            proc = subprocess.Popen(['aplay', '-D', ALSA_DEVICE, '-q', '--buffer-time=500000', play_path])
+            started = time.time()
+            if on_start:
+                on_start()                        # lip-sync from the moment aplay starts
+            try:
+                proc.wait(timeout=0.3)
+            except subprocess.TimeoutExpired:
+                return proc, started              # still running: it's playing
+            if proc.returncode == 0:
+                return proc, started              # a very short clip, already done
+            print(f"[BRIEFING] aplay failed ({proc.returncode}), retrying ({attempt + 1}/{attempts})")
+            self._wait_for_speaker(1.0)
+            time.sleep(0.2)
+        return None, None
+
+    BRIEFING_STALE_S = 3 * 3600   # asked for later in the day: re-fetch past this age
+
+    def _briefing_on_request(self):
+        """Voice: "morning briefing", "show me my briefing", "good morning"...
+        Like play_music: wait for this turn to finish, then take the busy lock
+        (giving up quietly if something else has it).  Outside the morning, or
+        if today's briefing is stale, a fresh one is fetched and rendered first."""
+        if not self._wait_until_idle({BotStates.SPEAKING, BotStates.THINKING}):
+            return
+        if not self._busy_lock.acquire(timeout=5.0):
+            print("[BRIEFING] Busy; not starting the briefing")
+            return
+        self.is_busy = True
+        self.last_user_interaction = time.time()
+        briefing = self.briefing_scheduler.briefing_for_today()
+        if briefing is None or time.time() - briefing.get("created", 0) > self.BRIEFING_STALE_S:
+            print("[BRIEFING] Preparing a fresh briefing on request")
+            # Fetching + rendering takes ~20-30 s: say so, so it doesn't look stuck.
+            result = {}
+            worker = threading.Thread(
+                target=lambda: result.update(b=self.briefing_scheduler.prepare_now()), daemon=True)
+            worker.start()
+            self.speak("One moment, friend! BMO is getting the latest weather and news.", msg="Getting your briefing...")
+            self.set_state(BotStates.THINKING, "Getting your briefing...")
+            self._thinking_sound_start()
+            try:
+                while worker.is_alive():
+                    self.last_user_interaction = time.time()   # keep the busy watchdog away
+                    worker.join(timeout=1.0)
+            finally:
+                self._thinking_sound_stop()
+            briefing = result.get("b")
+            if briefing is not None:
+                briefing = self.briefing_scheduler.briefing_for_today()   # with WAV paths
+        if briefing is None:
+            try:
+                self.speak("Sorry friend, BMO couldn't get your briefing right now.", msg="Oops!")
+            finally:
+                self.set_state(BotStates.IDLE, "Tap to speak")
+                self._release_busy()
+            return
+        self._play_briefing(briefing)
+
+    def _play_briefing(self, briefing):
+        """Play a cached briefing part by part.  The caller has claimed busy;
+        it's released here, whatever happens."""
+        from core.briefing.ui import ENTER_S, EXIT_S
+        valid_moods = set(TALK_MOODS.values()) | {"idle"}
+        aplay = None
+        try:
+            self.briefing_scheduler.mark_played()
+            mood = self._briefing_settings().get("talk_mood", "happy")
+            self._briefing_mood = mood if mood in valid_moods else "happy"
+            self._briefing_skip.clear()
+            self._briefing_stop.clear()
+            if self.briefing_view is None:
+                self.briefing_view = briefing_ui.BriefingView(self.face_view, (self.BG_WIDTH, self.BG_HEIGHT))
+            view = self.briefing_view
+            view.start(briefing)
+            self._briefing_frame_ms = []
+            self.set_state(BotStates.BRIEFING, "Good morning!")
+            print(f"[BRIEFING] Playing {len(briefing['parts'])} parts")
+            self._briefing_stop.wait(ENTER_S)    # BMO moves aside before the first card
+            self._wait_for_speaker()
+            for i, part in enumerate(briefing["parts"]):
+                if self._briefing_stop.is_set() or self.stop_event.is_set():
+                    break
+                self._briefing_skip.clear()
+                # Keep the 120 s busy watchdog from clearing the lock mid-briefing.
+                self.last_user_interaction = time.time()
+                if part["key"] == "signoff":
+                    self._briefing_mood = "happy"
+                if self.is_muted:
+                    # No voice: show the words and move on every 6 s.
+                    view.show_part(i, caption=part["text"])
+                    end = time.time() + 6.0
+                    while time.time() < end and not (self._briefing_skip.is_set() or self._briefing_stop.is_set()):
+                        time.sleep(0.05)
+                    continue
+                play_path = scaled_wav(part["path"], self._software_gain())
+                view.show_part(i)
+                lipsync = (lambda p=part["path"]: self._schedule_wav_lipsync(p)) \
+                    if self.face_view is not None else None
+                aplay, started = self._start_part_audio(play_path, lipsync)
+                if aplay is None:
+                    if play_path != part["path"]:
+                        try: os.remove(play_path)
+                        except OSError: pass
+                    if not (self._briefing_skip.is_set() or self._briefing_stop.is_set()):
+                        print(f"[BRIEFING] Couldn't play part {i}; showing it for 6 s instead")
+                        view.show_part(i, caption=part["text"])
+                        self._briefing_skip.wait(6.0)
+                    continue
+                marks = part.get("marks") or []
+                while aplay.poll() is None:
+                    if self._briefing_skip.is_set() or self._briefing_stop.is_set() or self.stop_event.is_set():
+                        aplay.terminate()
+                        with self._lip_lock:                  # close the mouth now
+                            self._lip_sched, self._lip_start = [], None
+                        break
+                    elapsed = time.time() - started
+                    passed = [m["mark"] for m in marks if m["at"] <= elapsed]
+                    if passed:
+                        view.set_highlight(passed[-1])
+                    time.sleep(0.04)
+                try:
+                    aplay.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    aplay.kill()
+                if aplay.returncode not in (0, None, -15) and not self._briefing_skip.is_set():
+                    print(f"[BRIEFING] aplay exited with {aplay.returncode} on part {i}")
+                aplay = None
+                if play_path != part["path"]:
+                    try: os.remove(play_path)
+                    except OSError: pass
+            view.finish()
+            time.sleep(EXIT_S)
+        except Exception as e:
+            print(f"[BRIEFING] Playback failed: {e}")
+            traceback.print_exc()
+        finally:
+            if aplay is not None and aplay.poll() is None:
+                aplay.kill()
+            # Leave BRIEFING before resetting the view, so no frame draws a reset view.
+            self.set_state(BotStates.HAPPY, "Have a great day!")
+            if self.briefing_view is not None:
+                self.briefing_view.reset()
+            ms = sorted(self._briefing_frame_ms)
+            if ms:
+                print(f"[BRIEFING] {len(ms)} frames: median {ms[len(ms) // 2]:.1f} ms, "
+                      f"p95 {ms[int(len(ms) * 0.95)]:.1f} ms, max {ms[-1]:.1f} ms")
+            self._release_busy()
+
+            def _back_to_idle():
+                if self.current_state == BotStates.HAPPY:
+                    self.set_state(BotStates.IDLE, "Tap to speak")
+            self.master.after(2000, _back_to_idle)
+
+    # --- GAMES ---
+    GAME_IDLE_S = 180      # nobody tapped for 3 minutes: back to BMO
+
+    def _play_game(self, key):
+        """Like play_music: wait for the turn to end, take the busy lock, then
+        hand the screen to the game until its X / Done (or 3 idle minutes)."""
+        from core.games import GAMES
+        from core.games.sound import GameSound
+        if key not in GAMES:
+            return
+        if not self._wait_until_idle({BotStates.SPEAKING, BotStates.THINKING}):
+            return
+        if not self._busy_lock.acquire(timeout=5.0):
+            print("[GAME] Busy; not starting")
+            return
+        self.is_busy = True
+        sound = None
+        try:
+            sound = None if self.is_muted else GameSound(ALSA_DEVICE, self._software_gain()).start()
+            self._game_sound = sound
+            self._game_last_tap = time.time()
+            self.game = GAMES[key](now=time.time())
+            print(f"[GAME] {self.game.name}")
+            self.set_state(BotStates.GAME, self.game.name)
+            while not self.game.finished and not self.stop_event.is_set():
+                now = time.time()
+                self.last_user_interaction = now          # the busy watchdog: a game is busy
+                if now - self._game_last_tap > self.GAME_IDLE_S:
+                    print("[GAME] No taps for 3 minutes; leaving")
+                    break
+                self.stop_event.wait(0.1)
+        finally:
+            self.game = None
+            self._game_sound = None
+            if sound is not None:
+                sound.stop()
+            self.set_state(BotStates.HAPPY, "That was fun!")
+            self._release_busy()
+
+            def _back_to_idle():
+                if self.current_state == BotStates.HAPPY:
+                    self.set_state(BotStates.IDLE, "Tap to speak")
+            self.master.after(2000, _back_to_idle)
+
+    # --- PRESENCE (camera motion) ---
+    PRESENCE_FPS = 4
+
+    def _presence_settings(self):
+        from core.briefing.settings import read_settings
+        s = {"enabled": True, "greet": True, "away_minutes": 10}
+        s.update(read_settings().get("presence") or {})
+        return s
+
+    def _presence_loop(self):
+        """Watch for someone walking up (a few tiny frames a second, CPU only):
+        wake from the screensaver, and offer a waiting morning briefing."""
+        s = self._presence_settings()
+        if not s.get("enabled", True):
+            print("[PRESENCE] Off (settings.json presence.enabled)")
+            return
+        presence = Presence(away_s=float(s.get("away_minutes", 10)) * 60)
+        warned = False
+        while not self.stop_event.is_set():
+            if not self.camera.running and not self.camera.start():
+                if not warned:
+                    print("[PRESENCE] No camera; retrying every 10 minutes "
+                          "(python -m core.camera --check explains why)")
+                    warned = True
+                if self.stop_event.wait(600):
+                    return
+                continue
+            if warned:
+                print("[PRESENCE] Camera found; watching for arrivals")
+                warned = False
+            frame = self.camera.motion_frame()
+            if frame is not None and presence.feed(frame, time.time()):
+                self.master.after(0, self._on_arrival)
+            self.stop_event.wait(1.0 / self.PRESENCE_FPS)
+
+    def _on_arrival(self):
+        """Someone walked up after the room was still for a while (Tk thread)."""
+        print("[PRESENCE] Arrival")
+        if self.current_state == BotStates.SCREENSAVER and not self.is_busy:
+            self.set_state(BotStates.IDLE, "Hi friend!")
+        today = datetime.date.today()
+        if (self.briefing_scheduler.is_ready_unplayed() and self._arrival_nudged_on != today
+                and self._presence_settings().get("greet", True)):
+            self._arrival_nudged_on = today
+            self.icon_overlay.wiggle()
+            threading.Thread(target=self._say_when_idle, daemon=True,
+                             args=("Good morning! Your briefing is ready. Tap the sun, or say brief me!",
+                                   "Good morning!")).start()
+
+    def _say_when_idle(self, text, msg):
+        """Speak something unprompted, but only into a quiet room: never over
+        a conversation, the briefing or a game."""
+        if not self._try_claim_busy():
+            return
+        try:
+            if self.current_state in (BotStates.IDLE, BotStates.SCREENSAVER):
+                self.speak(text, msg=msg)
+                self.set_state(BotStates.IDLE, "Tap to speak")
+        finally:
+            self._release_busy()
+
+    # --- WEATHER WARNINGS ---
+    ALERT_POLL_S = 15 * 60
+
+    def _alerts_loop(self):
+        """Announce new Environment Canada warnings for BMO's town (not at night;
+        those are read in the morning briefing instead)."""
+        from core.weather_alerts import AlertWatcher, spoken
+        watcher = None
+        while not self.stop_event.wait(60 if watcher is None else self.ALERT_POLL_S):
+            s = self._briefing_settings()
+            if not s.get("alerts", True):
+                continue
+            if watcher is None:
+                fc = self._briefing_forecast_location(s["location"])
+                if fc is None:
+                    continue
+                watcher = AlertWatcher(fc["lat"], fc["lon"], s["location"].title())
+                watcher.poll()         # what's active at start-up isn't news
+                continue
+            hour = datetime.datetime.now().hour
+            if hour >= 22 or hour < 7:
+                continue
+            for alert in watcher.poll()[:2]:
+                print(f"[ALERTS] New: {alert['title']} ({alert.get('area')})")
+                if self.current_state == BotStates.DISPLAY_IMAGE:
+                    continue
+                self._wait_until_idle({BotStates.SPEAKING, BotStates.LISTENING, BotStates.THINKING,
+                                       BotStates.BRIEFING}, poll_s=2.0, timeout_s=600)
+                self._say_when_idle(spoken(alert, s["location"].title()), "Weather warning!")
+
+    def _briefing_forecast_location(self, location):
+        """lat/lon for the briefing's location, from the cached forecast or wttr.in."""
+        from core.briefing import sources
+        fc = sources.get_forecast(location)
+        if fc and fc.get("lat") is not None:
+            return fc
+        return None
+
+    def _rearm_reminders(self):
+        """Restart saved timers still in the future; drop ones missed while off."""
+        for r in self.reminders.prune_past():
+            print(f"[TIMER DROPPED] missed while BMO was off: {r['message']!r}")
+        now = time.time()
+        for r in self.reminders.pending():
+            self.start_timer_thread((r["due"] - now) / 60, r["message"], reminder_id=r["id"],
+                                    kind=r.get("kind", "timer"))
 
     # --- STT & TTS ---
     def transcribe(self, filename):
@@ -1176,7 +1974,7 @@ class BotGUI:
                 if self.current_state == BotStates.SPEAKING:
                     self.mouth_open = min(60, vol / 25)
 
-                vol_scale = getattr(self, 'volume', VOLUME)
+                vol_scale = self._software_gain()
                 if vol_scale != 1.0:
                     scaled = np.clip(audio_chunk.astype(np.float32) * vol_scale, -32768, 32767).astype(np.int16)
                     write_chunk = scaled.tobytes()
@@ -1318,6 +2116,8 @@ class BotGUI:
             self._lip_sched = []
             self._lip_start = None
             self._lip_end = None
+        if self._lip_sync is not None:
+            self._lip_sync.reset()
 
         # Reader thread: Piper stdout → aplay stdin (with lip-sync)
         self._piper_reader_thread = threading.Thread(
@@ -1355,14 +2155,15 @@ class BotGUI:
             vol = np.sqrt(np.mean(audio_chunk.astype(np.float32) ** 2))
             if self.current_state == BotStates.SPEAKING:
                 play_offset = samples_written / sample_rate
+                speech = self._lip_sync.push(audio_chunk) if self._lip_sync is not None else None
                 with self._lip_lock:
                     if self._lip_start is None:
                         self._lip_start = time.time()
-                    self._lip_sched.append((play_offset, float(min(60, vol / 25))))
+                    self._lip_sched.append((play_offset, float(min(60, vol / 25)), speech))
                     self._lip_end = play_offset
             samples_written += len(audio_chunk)
 
-            vol_scale = getattr(self, 'volume', VOLUME)
+            vol_scale = self._software_gain()
             if vol_scale != 1.0:
                 scaled = np.clip(audio_chunk.astype(np.float32) * vol_scale, -32768, 32767).astype(np.int16)
                 write_chunk = scaled.tobytes()
@@ -1562,13 +2363,16 @@ class BotGUI:
             try:
                 if not self.is_muted:
                     # Lazily start the pipeline on the first sentence of a turn.
-                    # A pre-warmed Piper (no reader thread / aplay yet) still needs
-                    # _start_tts_turn to wire up audio output — otherwise we write
-                    # to Piper's stdin and nobody ever plays it.
-                    pipeline_incomplete = (
-                        self._piper_reader_thread is None or self._tts_aplay is None
+                    # Check the whole chain, not just Piper: the wake-word flow
+                    # pre-warms Piper with no reader/aplay attached, and writing
+                    # to that sends every sentence nowhere (logged, never heard).
+                    # _start_tts_turn() adopts a warm Piper and wires it up.
+                    pipeline_ready = (
+                        self._piper_proc is not None and self._piper_proc.poll() is None
+                        and self._piper_reader_thread is not None
+                        and self._tts_aplay is not None and self._tts_aplay.poll() is None
                     )
-                    if self._piper_proc is None or self._piper_proc.poll() is not None or pipeline_incomplete:
+                    if not pipeline_ready:
                         self._start_tts_turn()
                         if self._piper_proc is None:
                             # Failed to start — skip audio, still transition state
@@ -1639,7 +2443,16 @@ class BotGUI:
                     BotStates.CURIOUS, BotStates.DAYDREAM, BotStates.JAMMING,
                     BotStates.SHHH, BotStates.LOW_BATTERY,
                 }
-                if expr in allowed:
+                # Piper runs ahead of playback, so a tag late in the reply lands
+                # while BMO is still talking.  Switching state then froze the face
+                # on the expression (an open "O" for curious) for the rest of the
+                # sentence; instead talk on in that mood.
+                talking = self.current_state == BotStates.SPEAKING or (
+                    self._tts_aplay is not None and self._tts_aplay.poll() is None)
+                if expr in allowed and talking:
+                    if expr in TALK_MOODS:
+                        self._talk_mood = TALK_MOODS[expr]
+                elif expr in allowed:
                     self.set_state(expr, f"Feeling {expr}...")
                 chunk = (chunk[:span[0]] + chunk[span[1]:]).strip()
             elif action_data.get("action") == "play_music":
@@ -1658,6 +2471,24 @@ class BotGUI:
                             self.set_state(BotStates.IDLE, "Tap to speak")
                 threading.Thread(target=music_worker, daemon=True).start()
                 chunk = (chunk[:span[0]] + chunk[span[1]:]).strip()
+            elif action_data.get("action") == "play_game":
+                threading.Thread(target=self._play_game, args=(action_data.get("game"),), daemon=True).start()
+                chunk = (chunk[:span[0]] + chunk[span[1]:]).strip()
+            elif action_data.get("action") == "play_briefing":
+                threading.Thread(target=self._briefing_on_request, daemon=True).start()
+                chunk = (chunk[:span[0]] + chunk[span[1]:]).strip()
+            elif action_data.get("action") == "set_reminder":
+                # From core/timers.parse_reminder_request: an absolute time,
+                # so no 12-hour clamp (it can be days away).
+                try:
+                    minutes = (float(action_data["due"]) - time.time()) / 60
+                    msg_text = str(action_data.get("message") or "Reminder!")
+                    if minutes > 0:
+                        self.start_timer_thread(minutes, msg_text, kind="reminder")
+                        print(f"[TIMER] Reminder in {minutes:.0f} min — {msg_text!r}")
+                except (KeyError, TypeError, ValueError) as e:
+                    print(f"[TIMER] Bad set_reminder payload {action_data!r}: {e}")
+                chunk = (chunk[:span[0]] + chunk[span[1]:]).strip()
             elif action_data.get("action") == "set_timer":
                 # Real handler — was advertised in the system prompt but
                 # silently ignored.  Coerce minutes safely; clamp to [0.05, 720].
@@ -1669,7 +2500,7 @@ class BotGUI:
                     # Models like to echo the prompt's placeholder verbatim.
                     if msg_text in ("", "...", "…"):
                         msg_text = "Timer is up!"
-                    self.start_timer_thread(minutes, str(msg_text))
+                    self.start_timer_thread(minutes, str(msg_text), name=action_data.get("name"))
                     print(f"[TIMER] Scheduled: {minutes} min — {msg_text!r}")
                 except (TypeError, ValueError) as e:
                     print(f"[TIMER] Bad set_timer payload {action_data!r}: {e}")
@@ -1727,7 +2558,12 @@ class BotGUI:
                 # Pre-warm Piper in parallel with STT so the first TTS chunk has zero start-up gap
                 threading.Thread(target=self._warmup_piper, daemon=True).start()
                 wav_file = self.record_audio()
-                
+                if wav_file is None:  # no speech (or mic error): back to waiting
+                    if self.current_state != BotStates.ERROR:  # keep "Mic Error" visible
+                        self.set_state(BotStates.IDLE, "Tap to speak")
+                    self._release_busy()
+                    continue
+
                 # 3. Transcribe
                 self.set_state(BotStates.THINKING, "Transcribing...")
                 self._thinking_sound_start()
@@ -1798,21 +2634,13 @@ class BotGUI:
                     if taking_photo:
                         self.set_state(BotStates.CAPTURING, "Taking Photo...")
                         try:
-                            # Try libcamera-still (older) or rpicam-still (newer Pi OS)
-                            cam_cmd = None
-                            for candidate in ['libcamera-still', 'rpicam-still']:
-                                r = subprocess.run(['which', candidate], capture_output=True)
-                                if r.returncode == 0:
-                                    cam_cmd = candidate
-                                    break
-                            if cam_cmd is None:
-                                raise FileNotFoundError("No camera command found (libcamera-still / rpicam-still)")
-                            # Cap at 15 s — camera firmware can hang on USB glitches
-                            subprocess.run(
-                                [cam_cmd, '-o', 'temp.jpg', '--width', '640', '--height', '480',
-                                 '--nopreview', '-t', '2000', '--autofocus-mode', 'continuous'],
-                                check=True, timeout=15,
-                            )
+                            # The shared camera if presence detection holds it,
+                            # else rpicam-still; CameraError carries what to say.
+                            self.camera.photo('temp.jpg')
+                            # Looking takes ~1 minute: the LLM has to make room on
+                            # the NPU for the vision model (core/llm.py).
+                            self.speak("Ooh, let me take a good look! This takes me about a minute.",
+                                       msg="Looking...")
                             import base64
                             with open('temp.jpg', 'rb') as img_file:
                                 b64_string = base64.b64encode(img_file.read()).decode('utf-8')
@@ -1827,13 +2655,9 @@ class BotGUI:
                             except Exception:
                                 pass
                             self.speak(response)
-                        except FileNotFoundError as e:
+                        except CameraError as e:
                             print(f"Camera Error: {e}")
-                            self.speak("Hmm, BMO doesn't seem to have a camera connected right now. I can't take a photo!")
-
-                        except subprocess.TimeoutExpired:
-                            print("Camera Error: capture timed out after 15 s")
-                            self.speak("My camera took too long to respond. Let's try that again later!")
+                            self.speak(str(e))
 
                         except Exception as e:
                             print(f"Camera Error: {e}")
@@ -2059,6 +2883,7 @@ class BotGUI:
                         {"role": "user", "content": prompt}
                     ],
                     "stream": False,
+                    "keep_alive": LLM_KEEP_ALIVE,
                     "options": {"temperature": 0.9, "num_predict": 20}
                 }
                 
@@ -2155,6 +2980,7 @@ class BotGUI:
                             {"role": "user", "content": thought_prompt}
                         ],
                         "stream": False,
+                        "keep_alive": LLM_KEEP_ALIVE,
                         "options": {"temperature": 0.8, "num_predict": 40}
                     }
                     try:
@@ -2220,6 +3046,7 @@ class BotGUI:
                     {"role": "user", "content": thought_prompt},
                 ]),
                 "stream": False,
+                "keep_alive": LLM_KEEP_ALIVE,
                 "options": {"temperature": 0.8, "num_predict": 256}
             }
             resp = http_requests.post(LLM_URL, json=payload, timeout=60)
@@ -2389,6 +3216,7 @@ class BotGUI:
                                 "model": FAST_LLM_MODEL,
                                 "messages": topic_messages,
                                 "stream": False,
+                                "keep_alive": LLM_KEEP_ALIVE,
                                 "options": {"temperature": 1.2, "num_predict": 30}
                             }
                             topic_resp = http_requests.post(LLM_URL, json=topic_payload, timeout=10)
@@ -2451,7 +3279,49 @@ class BotGUI:
                 if self.current_state != BotStates.SCREENSAVER and not self.is_busy and self.current_state != BotStates.DISPLAY_IMAGE:
                     self.set_state(BotStates.SCREENSAVER, "Sleeping...")
 
+def _claim_single_instance():
+    """Exit if another BMO agent is already running.
+
+    A second copy (e.g. the desktop icon tapped while BMO is up) can't open the
+    USB mic — the first holds it exclusively — so it silently falls back to
+    another input and the two talk over each other.  flock is released by the
+    kernel when the process exits or crashes, so a stale lock never blocks a
+    restart.  Returns the open lock file, which must stay referenced."""
+    import fcntl
+    path = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or "/tmp", "bmo-agent.lock")
+    lock = open(path, "a+")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        lock.seek(0)
+        other = lock.read().strip() or "unknown"
+        print(f"[BMO] Another BMO is already running (PID {other}) — exiting.")
+        sys.exit(0)
+    lock.seek(0)
+    lock.truncate()
+    lock.write(str(os.getpid()))
+    lock.flush()
+    return lock
+
+
+def _enable_briefing_now():
+    """--briefing-now: open a morning-briefing window from now for an hour,
+    with a fresh render, icon and chime, so the screen can be tried any time."""
+    global BRIEFING_NOW_WINDOW
+    import shutil
+    from core.briefing import audio as _audio
+    now = datetime.datetime.now()
+    end = min(now + datetime.timedelta(hours=1), now.replace(hour=23, minute=59))
+    BRIEFING_NOW_WINDOW = (now.strftime("%H:%M"), end.strftime("%H:%M"))
+    shutil.rmtree(_audio.day_dir(now.date()), ignore_errors=True)  # re-render, re-chime
+    print(f"[BRIEFING] --briefing-now: window {BRIEFING_NOW_WINDOW[0]}-{BRIEFING_NOW_WINDOW[1]}; "
+          "the icon appears once it's rendered (~20 s)")
+
+
 if __name__ == "__main__":
+    _instance_lock = _claim_single_instance()
+    if "--briefing-now" in sys.argv[1:]:
+        _enable_briefing_now()
     root = tk.Tk()
     app = BotGUI(root)
     # Window-manager close (X button, system kill) routes through the same

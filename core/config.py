@@ -14,6 +14,10 @@ _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # To offload to your Linux server, change this to: "http://blackbox.clevercode.ts.net:11434/api/chat"
 # Make sure Ollama is running on the blackbox server and listening on 0.0.0.0
 LLM_URL = "http://127.0.0.1:8000/api/chat"
+# Sent with every LLM request.  hailo-ollama otherwise unloads the model after
+# ~5 min idle, and the next question pays a 7-36 s reload (it looked like BMO
+# was stuck thinking).  -1 = keep loaded; verified the idle timer stops.
+LLM_KEEP_ALIVE = -1
 LLM_MODEL = "qwen3:1.7b" # Native Hailo model for all queries
 FAST_LLM_MODEL = "qwen3:1.7b" # Unify models to prevent NPU swap crashing
 
@@ -170,6 +174,15 @@ WHISPER_MODEL = os.environ.get(
     os.path.join(_PROJECT_ROOT, "models", "ggml-base.en.bin"),
 )
 WHISPER_THREADS = os.environ.get("WHISPER_THREADS", "4")  # Pi 5 has 4 cores
+# Example text whisper conditions on.  base.en misheard a quick "What's the
+# weather doing tomorrow?" as "What's the method doing to Murray?" (and the LLM
+# improvised a creepy story about it).  Natural sentences, not a keyword list
+# (which had no effect); it must not contain phrasings users say verbatim, or
+# whisper bends their words towards it.  Tested on 9 unrelated clips: no change.
+WHISPER_PROMPT = os.environ.get(
+    "WHISPER_PROMPT",
+    "Hey BMO, what's the weather like? Is it going to rain tomorrow? Tell me a joke.",
+)
 # Timeout for NPU Speech2Text inference (ms). Whisper-Small on H10H is typically
 # 3-8 s for a 5 s utterance; 20 s gives room for NPU scheduling overhead.
 WHISPER_NPU_TIMEOUT_MS = int(os.environ.get("WHISPER_NPU_TIMEOUT_MS", "20000"))
@@ -188,21 +201,25 @@ def find_audio_devices():
     speaker_name = "plughw:CARD=UACDemoV10,DEV=0" # Default fallback (UACDemo speaker)
     
     # Preferred names for BMO hardware
-    pref_mics = ("USB PnP Sound Device", "USB Audio Device")
-    pref_speakers = ("UACDemoV10", "USB PnP Sound Device")
-    
+    # Ordered by priority: compact C-Media mic first, then the older USB mic
+    pref_mics = ["USB PnP Sound Device", "USB Audio Device"]
+    pref_speaker = "UACDemoV10"
+
     found_mic = False
-    for i, dev in enumerate(devices):
-        # Ensure the device actually has input channels before picking it
-        if any(m in dev['name'] for m in pref_mics) and dev.get('max_input_channels', 0) > 0:
-            mic_idx = i
-            found_mic = True
-            print(f"[CONFIG] Found Mic by name: {dev['name']} at index {i}")
-        for m in pref_speakers:
-            if m in dev['name'] and dev.get('max_output_channels', 0) > 0:
-                speaker_name = 'plughw:CARD=' + m.replace(' ', '') + ',DEV=0'
-                print(f"[CONFIG] Found Speaker: {dev['name']} -> using {speaker_name}")
+    for pref_mic in pref_mics:
+        for i, dev in enumerate(devices):
+            # Ensure the device actually has input channels before picking it
+            if pref_mic in dev['name'] and dev.get('max_input_channels', 0) > 0:
+                mic_idx = i
+                found_mic = True
+                print(f"[CONFIG] Found Mic by name: {dev['name']} at index {i}")
                 break
+        if found_mic:
+            break
+    for dev in devices:
+        if pref_speaker in dev['name']:
+            speaker_name = "plughw:UACDemoV10,0"
+            print(f"[CONFIG] Found Speaker: {dev['name']} -> using {speaker_name}")
             
     # Fallback: if no mic found by name, pick the first one with input channels
     if not found_mic:

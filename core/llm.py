@@ -1,14 +1,16 @@
 import base64
 import os
+import threading
+import time
 import requests
 import logging
 import re
 import json
 import urllib.parse
 import numpy as np
-from .config import LLM_URL, LLM_MODEL, FAST_LLM_MODEL, VISION_MODEL, VLM_HEF_PATH, get_system_prompt, get_current_context
+from .config import LLM_URL, LLM_KEEP_ALIVE, LLM_MODEL, FAST_LLM_MODEL, VISION_MODEL, VLM_HEF_PATH, get_system_prompt, get_current_context
 from .tts import add_pronunciation
-from .search import search_web, search_images
+from .search import get_weather, search_web, search_images
 
 def _internet_available(timeout_s: float = 1.5) -> bool:
     """Cheap offline gate for voice-turn web search.
@@ -93,7 +95,11 @@ def delegate_to_hermes(prompt: str) -> str:
         out = "My big friend Hermes didn't say anything back."
     print(f"[HERMES] Got {len(out)} chars from Hermes.")
     return out
-from .timers import describe_duration, parse_timer_request
+from .timers import (describe_duration, describe_when, match_reminders, parse_reminder_query,
+                     parse_reminder_request, parse_timer_request)
+from .briefing import intents as briefing_intents
+from . import quick_answers
+from .games import voice as game_voice
 
 logger = logging.getLogger(__name__)
 
@@ -198,6 +204,75 @@ def _get_vlm():
     return _vlm_instance, shape, dtype
 
 
+def _label(r) -> str:
+    """'the pasta timer', 'the timer', 'your reminder to put the bins out'."""
+    if r.get("name"):
+        return f"the {r['name']} timer"
+    if r.get("kind", "timer") == "timer" and r.get("message") == "Timer is up!":
+        return "the timer"
+    what = r.get("message", "").rstrip("!.")
+    return f"your reminder to {what[:1].lower()}{what[1:]}" if what and what != "Reminder" else "your reminder"
+
+
+def _end(text: str) -> str:
+    """Finish a sentence without doubling the stop of a trailing 'a.m.'."""
+    return text if text.endswith((".", "!", "?")) else text + "."
+
+
+def _or_list(labels):
+    return labels[0] if len(labels) == 1 else ", ".join(labels[:-1]) + " or " + labels[-1]
+
+
+def _describe_item(r, lead=False) -> str:
+    """'the pasta timer has 4 minutes left' / 'your reminder to call mum is tomorrow at 9 a.m.'"""
+    left = r["due"] - time.time()
+    label = _label(r)
+    if lead:
+        label = label[:1].upper() + label[1:]
+    if r.get("kind", "timer") == "timer" and left < 12 * 3600:
+        if left < 60:
+            return f"{label} has {max(1, int(left))} seconds left"
+        m, sec = divmod(int(left), 60)
+        h, m = divmod(m, 60)
+        parts = ([f"{h} hour{'s' if h != 1 else ''}"] if h else []) + \
+                ([f"{m} minute{'s' if m != 1 else ''}"] if m else [])
+        return f"{label} has {' '.join(parts)} left"
+    return f"{label} is {describe_when(r['due'])}"
+
+
+VLM_NPU_WAIT_S = 25
+
+
+def _free_npu_for_vlm():
+    """Ask hailo-ollama to unload its model so the VLM can open the NPU.
+
+    hailo-ollama holds the NPU exclusively while a model is loaded, and BMO
+    pins the LLM there (keep_alive -1), so the VLM could never start ("eyes
+    aren't working").  A request with keep_alive 0 unloads it; the device is
+    free ~5 s later.  The LLM is reloaded in the background afterwards."""
+    payload = {"model": FAST_LLM_MODEL, "messages": [{"role": "user", "content": "hi"}],
+               "stream": False, "keep_alive": 0, "options": {"num_predict": 1}}
+    try:
+        requests.post(LLM_URL, json=payload, timeout=60)
+    except requests.exceptions.RequestException as e:
+        logger.warning(f"Couldn't ask hailo-ollama to unload: {e}")
+
+
+def _get_vlm_when_free(wait_s: float = VLM_NPU_WAIT_S):
+    """_get_vlm(), retrying while hailo-ollama is still letting go of the NPU."""
+    end = time.monotonic() + wait_s
+    while True:
+        try:
+            return _get_vlm()
+        except FileNotFoundError:
+            raise
+        except Exception as e:
+            if time.monotonic() >= end:
+                raise
+            logger.info(f"NPU not free yet ({e}); retrying")
+            time.sleep(2.0)
+
+
 def _decode_image_to_frame(image_b64: str, target_shape, target_dtype=np.uint8):
     """Decode a base64 JPEG/PNG into a numpy array matching VLM input requirements."""
     import cv2
@@ -217,6 +292,11 @@ def _decode_image_to_frame(image_b64: str, target_shape, target_dtype=np.uint8):
 
     return img.astype(target_dtype)
 
+_WEATHER_KEYWORDS = (
+    "weather", "forecast", "temperature", "raining", "snowing", "how cold", "how hot",
+    "jacket", "coat", "umbrella", "cold outside", "hot outside",
+)
+
 # Keep at most this many messages (plus the system prompt) to avoid
 # unbounded memory growth on memory-constrained devices like a Pi.
 MAX_HISTORY_MESSAGES = 20
@@ -224,6 +304,38 @@ MAX_HISTORY_MESSAGES = 20
 # cache overflows (stream dies with "Could not connect to my brain") well
 # before ~6k chars of history; keep it well inside a safe window.
 MAX_HISTORY_CHARS = 4000
+
+# hailo-ollama's qwen3:1.7b HEF has a fixed ~2k-token context and ignores
+# num_ctx.  Past it the server silently drops the stream ("Response ended
+# prematurely") — measured failing at ~6.2k chars of messages, fine at ~5.5k.
+# Because a failed turn never appends a reply, an over-long saved history kept
+# BMO stuck "thinking" forever, even across restarts.  Budget the prompt in
+# characters (system prompt included) with room left for the 120-token reply.
+MAX_CONTEXT_CHARS = 4500
+# When the saved history outgrows the budget, cut it well below so the next few
+# turns share an unchanged prefix — hailo-ollama only reuses its KV cache when
+# earlier turns match exactly (first token ~0.8 s cached vs ~3-10 s re-prefilled).
+TRIM_TARGET_CHARS = 2800
+
+
+def _fit_context(messages: list, budget: int = MAX_CONTEXT_CHARS) -> list:
+    """Drop the oldest non-system messages until the total content fits `budget`.
+
+    The system prompt and the final message are always kept, and the retained
+    conversation always starts on a user turn so roles keep alternating."""
+    if not messages:
+        return messages
+    head = [messages[0]] if messages[0].get("role") == "system" else []
+    body = list(messages[len(head):])
+
+    def size(msgs):
+        return sum(len(m.get("content") or "") for m in msgs)
+
+    while len(body) > 1 and size(head + body) > budget:
+        body.pop(0)
+        while len(body) > 1 and body[0].get("role") != "user":
+            body.pop(0)
+    return head + body
 
 _DISPLAY_IMAGE_KEYWORDS = [
     "show me a picture", "show me an image", "show me a photo",
@@ -491,6 +603,7 @@ def _quick_lead_in(user_text: str, intent: str) -> str:
                 {"role": "user", "content": user_text},
             ]),
             "stream": False,
+            "keep_alive": LLM_KEEP_ALIVE,
             "options": {"temperature": 0.8, "num_predict": 30},
         }
         r = requests.post(LLM_URL, json=payload, timeout=0.6)
@@ -579,6 +692,14 @@ class Brain:
         memory.json, clobbering the long-lived desktop agent's memory — two
         processes racing last-writer-wins over one file."""
         self.persist = persist
+        # Set by the agent: () -> True while a morning briefing is ready and
+        # unplayed.  None (web_app, cli) skips briefing routing entirely.
+        self.briefing_ready = None
+        # Set by the agent: the shared core.reminders.ReminderRegistry, so
+        # "what reminders do I have?" / "cancel the pasta timer" work.
+        self.reminders = None
+        # Set by the agent when settings.json has a home_assistant block.
+        self.home = None
         self.history = []
         if persist:
             self.load_history()
@@ -598,6 +719,24 @@ class Brain:
         if persist:
             import atexit as _atexit
             _atexit.register(self._save_on_exit)
+
+    def warm_up(self):
+        """Load the model onto the NPU (and pin it there) before the first question.
+
+        hailo-ollama loads lazily, so without this the first question after a
+        boot or server restart waits 7-36 s for the model on top of generation."""
+        payload = {
+            "model": FAST_LLM_MODEL,
+            "messages": _sanitize_messages([self.history[0], {"role": "user", "content": "Hi"}]),
+            "stream": False,
+            "keep_alive": LLM_KEEP_ALIVE,
+            "options": {"num_predict": 1},
+        }
+        try:
+            requests.post(LLM_URL, json=payload, timeout=120)
+            logger.info("LLM warmed up.")
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"LLM warm-up failed: {e}")
 
     def load_history(self):
         """Load chat history from memory.json if it exists."""
@@ -655,12 +794,111 @@ class Brain:
         # history[0] is always the system prompt
         non_system = self.history[1:]
         if len(non_system) > MAX_HISTORY_MESSAGES:
-            non_system = non_system[-MAX_HISTORY_MESSAGES:]
-        # Drop oldest while over the char budget (keep at least the last 2 msgs).
-        while len(non_system) > 2 and sum(len(m.get("content", "")) for m in non_system) > MAX_HISTORY_CHARS:
-            non_system.pop(0)
-        self.history = [self.history[0]] + non_system
+            self.history = [self.history[0]] + non_system[-MAX_HISTORY_MESSAGES:]
+        if sum(len(m.get("content") or "") for m in self.history) > MAX_CONTEXT_CHARS:
+            self.history = _fit_context(self.history, budget=TRIM_TARGET_CHARS)
         self.save_history()
+
+    def _briefing_action(self, user_text: str):
+        """'{"action": "play_briefing"}' if this asks for the briefing, else None.
+
+        "Good morning" only plays a briefing that's ready and unplayed (else
+        BMO chats as usual); "morning briefing" and friends play any time.
+        No lead-in: the briefing opens with its own greeting."""
+        if self.briefing_ready is None:
+            return None
+        intent = briefing_intents.match(user_text)
+        if intent == briefing_intents.BRIEFING or (
+                intent == briefing_intents.GOOD_MORNING and self.briefing_ready()):
+            print(f"[LLM] Briefing MATCHED ({intent}): '{user_text[:60]}'")
+            return '{"action": "play_briefing"}'
+        return None
+
+    @staticmethod
+    def _game_action(user_text: str):
+        """(lead-in, action) for "let's play a game" / "play BMO says", else None."""
+        key = game_voice.match(user_text)
+        if key is None:
+            return None
+        from .games import GAMES
+        print(f"[LLM] Game MATCHED: {key}")
+        return f"Yay! Let's play {GAMES[key].name}!", json.dumps({"action": "play_game", "game": key})
+
+    @staticmethod
+    def _reminder_reply(user_text: str):
+        """(spoken, action) for "remind me tomorrow at 9 to ..." or None."""
+        r = parse_reminder_request(user_text)
+        if r is None:
+            return None
+        when = describe_when(r["due"])
+        if r["message"] == "Alarm!":
+            spoken = f"Okay friend! I set an alarm for {when}"
+        elif r["message"] == "Reminder!":
+            spoken = f"Okay friend! I'll remind you {when}"
+        else:
+            spoken = f"Okay friend! I'll remind you {when} to {r['message'].rstrip('!.')[:1].lower()}" \
+                     f"{r['message'].rstrip('!.')[1:]}"
+        if not spoken.endswith("."):
+            spoken += "."
+        return spoken, json.dumps({"action": "set_reminder", **r})
+
+    def _reminder_query_reply(self, user_text: str):
+        """Spoken answer to "what reminders do I have?", "cancel the pasta
+        timer", "how long left?"; None if it isn't one (or no registry)."""
+        if self.reminders is None:
+            return None
+        q = parse_reminder_query(user_text)
+        if q is None:
+            return None
+        print(f"[LLM] Reminder query MATCHED: {q}")
+        items = self.reminders.pending()
+        if q["action"] == "list":
+            if not items:
+                return "You don't have any timers or reminders right now."
+            said = [_describe_item(r) for r in items[:4]]
+            more = f", and {len(items) - 4} more" if len(items) > 4 else ""
+            n = len(items)
+            return _end(f"You have {n} {'thing' if n == 1 else 'things'} set: " + "; ".join(said) + more)
+        hits = match_reminders(items, q["target"])
+        if q["action"] == "cancel":
+            if q.get("all"):
+                for r in hits:
+                    self.reminders.remove(r["id"])
+                return "Okay! Everything's cancelled." if hits else "There's nothing to cancel, friend."
+            if not hits:
+                return "Hmm, BMO couldn't find that one." if items else "There's nothing to cancel, friend."
+            if len(hits) > 1:
+                return "Which one? You have " + _or_list([_label(r) for r in hits]) + "."
+            self.reminders.remove(hits[0]["id"])
+            return f"Okay, I cancelled {_label(hits[0])}."
+        # time left
+        if not hits:
+            return "Hmm, BMO couldn't find that one." if items else "You don't have any timers running."
+        if len(hits) > 1 and q["target"] is None:
+            timers = [r for r in hits if r.get("kind", "timer") == "timer"]
+            hits = timers if len(timers) == 1 else hits
+        if len(hits) > 1:
+            return _end("; ".join(_describe_item(r) for r in hits[:4]))
+        return _end(_describe_item(hits[0], lead=True))
+
+    def _instant_reply(self, user_text: str):
+        """Answers that don't need the LLM: timer/reminder questions, time,
+        date, days-until, maths, units, then Home Assistant commands (last:
+        its "open/turn on X" verbs must not catch the photo or music routes)."""
+        answer = self._reminder_query_reply(user_text)
+        if answer is None:
+            answer = quick_answers.answer(user_text)
+            if answer is not None:
+                print(f"[LLM] Quick answer: {answer!r}")
+        if answer is None and self.home is not None:
+            try:
+                answer = self.home.handle(user_text)
+            except Exception as e:
+                logger.warning(f"Home Assistant error: {e}")
+                answer = None
+            if answer is not None:
+                print(f"[LLM] Home Assistant: {answer!r}")
+        return answer
 
     def think(self, user_text: str) -> str:
         """
@@ -681,6 +919,19 @@ class Brain:
                 self.history.append({"role": "assistant", "content": answer})
                 self.save_history()
             return answer or ""
+
+        # Pre-LLM briefing check first: it only matches whole-utterance
+        # requests, and "show me my briefing" mustn't reach the image check.
+        briefing = self._briefing_action(user_text)
+        if briefing:
+            self.history.append({"role": "assistant", "content": briefing})
+            return briefing
+
+        game = self._game_action(user_text)
+        if game:
+            combined = " ".join(game)
+            self.history.append({"role": "assistant", "content": combined})
+            return combined
 
         # Pre-LLM camera check — same logic as stream_think
         camera_keywords = [
@@ -728,25 +979,38 @@ class Brain:
         timer = parse_timer_request(user_text)
         if timer is not None:
             action = json.dumps({"action": "set_timer", **timer})
-            spoken = f"Okay friend! I set a timer for {describe_duration(timer['minutes'])}."
+            spoken = (f"Okay friend! I set a {timer['name']} timer for {describe_duration(timer['minutes'])}."
+                      if timer.get("name") else
+                      f"Okay friend! I set a timer for {describe_duration(timer['minutes'])}.")
             print(f"[LLM] Timer MATCHED: {timer}")
             combined = (spoken + " " + action).strip()
             self.history.append({"role": "assistant", "content": combined})
             return combined
 
+        # Reminders for a clock time or a day ("tomorrow at 9", "on Friday").
+        reminder = self._reminder_reply(user_text)
+        if reminder is not None:
+            print(f"[LLM] Reminder MATCHED: {reminder[1]}")
+            combined = " ".join(reminder)
+            self.history.append({"role": "assistant", "content": combined})
+            return combined
+
+        # Instant answers: timers/reminders, time, maths, units, smart home.
+        answer = self._instant_reply(user_text)
+        if answer is not None:
+            self.history.append({"role": "assistant", "content": answer})
+            return answer
+
         print(f"[LLM] No pre-LLM action matched for: '{lower_text[:60]}'")
 
-        # Pre-LLM web search — same logic as stream_think
-        realtime_keywords = [
-            "weather", "forecast", "temperature", "tonight", "tomorrow",
-            "news", "latest", "right now", "score", "stocks", "bitcoin",
-            "crypto", "price of", "happening", "recently", "live",
-        ]
+        # Pre-LLM web search — same logic as stream_think.  General search stays
+        # with the LLM's tool-use path; weather is the only pre-LLM exception
+        # (wttr.in answers in <1 s and without it BMO invents the weather).
         question_markers = [
             "what", "who", "when", "where", "find", "search", "tell me",
-            "look up", "check", "is there", "did", "?",
+            "look up", "check", "is there", "did", "?", "is it", "will it", "how",
         ]
-        has_realtime_kw = any(kw in lower_text for kw in realtime_keywords)
+        has_realtime_kw = any(kw in lower_text for kw in _WEATHER_KEYWORDS)
         has_question = any(m in lower_text for m in question_markers)
         # Weather is a command, not a question: "Weather Toronto" carries no
         # question marker but obviously needs live data.
@@ -755,12 +1019,12 @@ class Brain:
         # Offline gate: never let a dead connection stall the turn.  If there is
         # no route out, skip search entirely and let the LLM answer from weights.
         if has_realtime_kw and has_question and not _internet_available():
-            print("[LLM] Offline — skipping web search.")
+            print("[LLM] Offline — skipping weather lookup.")
             has_realtime_kw = False
         search_injected = False
         if has_realtime_kw and has_question:
             try:
-                search_result = search_web(user_text)
+                search_result = get_weather(user_text)  # only weather is routed here
                 if search_result and search_result not in ("SEARCH_EMPTY", "SEARCH_ERROR") and len(search_result) > 50:
                     # Strip the verbose "SEARCH RESULTS for '...':" header from search.py
                     clean_result = re.sub(r"^SEARCH RESULTS for '.*?':\n?", "", search_result).strip()
@@ -785,8 +1049,9 @@ class Brain:
 
         payload = {
             "model": chosen_model,
-            "messages": _sanitize_messages(_with_current_context(self.history)),
+            "messages": _sanitize_messages(_fit_context(_with_current_context(self.history))),
             "stream": False,
+            "keep_alive": LLM_KEEP_ALIVE,
             "options": {
                 "temperature": 0.7,
                 # ~4.5 tok/s on the H10H, so num_predict is a latency budget, not
@@ -838,7 +1103,8 @@ class Brain:
                             summary_payload = {
                                 "model": FAST_LLM_MODEL,
                                 "messages": _sanitize_messages(summary_prompt),
-                                "stream": False
+                                "stream": False,
+                                "keep_alive": LLM_KEEP_ALIVE,
                             }
 
                             summary_response = requests.post(LLM_URL, json=summary_payload, timeout=180)
@@ -930,6 +1196,20 @@ class Brain:
                 yield answer
             return
 
+        # Pre-LLM briefing check first (see think()).
+        briefing = self._briefing_action(user_text)
+        if briefing:
+            self.history.append({"role": "assistant", "content": briefing})
+            yield briefing
+            return
+
+        game = self._game_action(user_text)
+        if game:
+            yield game[0]
+            self.history.append({"role": "assistant", "content": " ".join(game)})
+            yield game[1]
+            return
+
         # Pre-LLM camera check: if user asks to take a photo / look at something,
         # emit the action JSON directly without calling the LLM.
         # This is more reliable than hoping the small model emits the right JSON.
@@ -981,11 +1261,29 @@ class Brain:
         timer = parse_timer_request(user_text)
         if timer is not None:
             action = json.dumps({"action": "set_timer", **timer})
-            spoken = f"Okay friend! I set a timer for {describe_duration(timer['minutes'])}."
+            spoken = (f"Okay friend! I set a {timer['name']} timer for {describe_duration(timer['minutes'])}."
+                      if timer.get("name") else
+                      f"Okay friend! I set a timer for {describe_duration(timer['minutes'])}.")
             print(f"[LLM-STREAM] Timer MATCHED: {timer}")
             yield spoken
             self.history.append({"role": "assistant", "content": (spoken + " " + action).strip()})
             yield action
+            return
+
+        # Reminders for a clock time or a day ("tomorrow at 9", "on Friday").
+        reminder = self._reminder_reply(user_text)
+        if reminder is not None:
+            print(f"[LLM-STREAM] Reminder MATCHED: {reminder[1]}")
+            yield reminder[0]
+            self.history.append({"role": "assistant", "content": " ".join(reminder)})
+            yield reminder[1]
+            return
+
+        # Instant answers: timers/reminders, time, maths, units, smart home.
+        answer = self._instant_reply(user_text)
+        if answer is not None:
+            self.history.append({"role": "assistant", "content": answer})
+            yield answer
             return
 
         print(f"[LLM-STREAM] No pre-LLM action matched for: '{lower_text[:60]}'")
@@ -995,16 +1293,11 @@ class Brain:
         # Require at least one realtime keyword AND the text to look like a question
         # (contains 'what', 'who', 'when', 'find', 'search', '?', etc.) to avoid
         # false triggers on casual phrases like 'how are you doing today'.
-        realtime_keywords = [
-            "weather", "forecast", "temperature", "tonight", "tomorrow",
-            "news", "latest", "right now", "score", "stocks", "bitcoin",
-            "crypto", "price of", "happening", "recently", "live",
-        ]
         question_markers = [
             "what", "who", "when", "where", "find", "search", "tell me",
-            "look up", "check", "is there", "did", "?",
+            "look up", "check", "is there", "did", "?", "is it", "will it", "how",
         ]
-        has_realtime_kw = any(kw in lower_text for kw in realtime_keywords)
+        has_realtime_kw = any(kw in lower_text for kw in _WEATHER_KEYWORDS)
         has_question = any(m in lower_text for m in question_markers)
         # Weather is a command, not a question: "Weather Toronto" carries no
         # question marker but obviously needs live data.
@@ -1013,13 +1306,13 @@ class Brain:
         # Offline gate: never let a dead connection stall the turn.  If there is
         # no route out, skip search entirely and let the LLM answer from weights.
         if has_realtime_kw and has_question and not _internet_available():
-            print("[LLM] Offline — skipping web search.")
+            print("[LLM] Offline — skipping weather lookup.")
             has_realtime_kw = False
         needs_search = has_realtime_kw and has_question
         search_injected = False
         if needs_search:
             try:
-                search_result = search_web(user_text)
+                search_result = get_weather(user_text)  # only weather is routed here
                 # Only inject if we got a real result (not empty/error sentinel)
                 if search_result and search_result not in ("SEARCH_EMPTY", "SEARCH_ERROR") and len(search_result) > 50:
                     # Strip verbose "SEARCH RESULTS for '...':" prefix from search.py
@@ -1044,10 +1337,17 @@ class Brain:
 
 
 
+        messages = _fit_context(_with_current_context(self.history))
+        # Keep the time-stamped user turn in history so next turn's prefix is
+        # byte-identical to what the server saw and its KV cache is reused.
+        if self.history and self.history[-1].get("role") == "user":
+            self.history[-1] = messages[-1]
+
         payload = {
             "model": chosen_model,
-            "messages": _sanitize_messages(_with_current_context(self.history)),
+            "messages": _sanitize_messages(messages),
             "stream": True,
+            "keep_alive": LLM_KEEP_ALIVE,
             "options": {
                 "temperature": 0.7,
                 # ~4.5 tok/s on the H10H, so num_predict is a latency budget, not
@@ -1060,6 +1360,7 @@ class Brain:
         }
 
         full_content = ""
+        raw_content = ""  # exactly as generated, for history / KV-cache reuse
         buffer = ""
         assistant_appended = False
         thinker = ThinkStripper()
@@ -1075,7 +1376,8 @@ class Brain:
                                 chunk = data.get("message", {}).get("content", "")
                                 if not chunk:
                                     continue
-                                    
+                                raw_content += chunk
+
                                 # Replace smart quotes
                                 chunk = chunk.replace('“', '"').replace('”', '"').replace('‘', "'").replace('’', "'")
 
@@ -1098,7 +1400,9 @@ class Brain:
                                 )
                                 # Treat short buffers as not ready to flush
                                 trimmed = buffer.strip()
-                                too_short = len(trimmed) < 10
+                                # ...except exclamations/questions: speaking "Oh my!" the
+                                # moment it arrives gives BMO a voice ~2 s sooner at 5 tok/s.
+                                too_short = len(trimmed) < (4 if trimmed.endswith(('!', '?')) else 10)
                                 # Common abbrev. tail check (case-insensitive)
                                 abbrev_tail = any(
                                     trimmed.lower().endswith(a) for a in (
@@ -1137,7 +1441,7 @@ class Brain:
                         # For advanced tool use we won't yield the json action to TTS
                         pass
                     
-                    self.history.append({"role": "assistant", "content": strip_think_blocks(full_content) or full_content})
+                    self.history.append({"role": "assistant", "content": strip_think_blocks(raw_content) or raw_content})
                     assistant_appended = True
                     self.save_history()
 
@@ -1145,7 +1449,7 @@ class Brain:
                     # accumulate and confuse the model on future turns.
                     if search_injected:
                         for msg in reversed(self.history):
-                            if msg.get("role") == "user" and msg.get("content", "").startswith("[LIVE DATA:"):
+                            if msg.get("role") == "user" and "[LIVE DATA:" in msg.get("content", ""):
                                 msg["content"] = user_text
                                 break
 
@@ -1202,13 +1506,12 @@ class Brain:
         self.history.append({"role": "user", "content": user_text})
         assistant_appended = False
 
+        freed = False
         try:
-            # Free the NPU: hailo-ollama holds /dev/hailo0 exclusively for the
-            # LLM; without this the VLM can never init (HAILO_OUT_OF_PHYSICAL_DEVICES).
-            _unload_llm_from_npu()
-            import time as _time
-            _time.sleep(0.5)  # let the driver finish releasing the device
-            vlm, frame_shape, frame_dtype = _get_vlm()
+            if _vlm_instance is None:
+                _free_npu_for_vlm()
+                freed = True
+            vlm, frame_shape, frame_dtype = _get_vlm_when_free()
 
             # Decode the base64 image into a numpy frame the VLM expects
             frame = _decode_image_to_frame(image_base64, frame_shape, frame_dtype)
@@ -1229,7 +1532,6 @@ class Brain:
 
             # Run generate_all with a hard timeout so a hung/throttled NPU
             # doesn't freeze the agent indefinitely.
-            import threading
             result = {"content": None, "exc": None}
 
             def _run():
@@ -1282,6 +1584,9 @@ class Brain:
                              "Restart BMO to recover the NPU for the LLM.")
             else:
                 _release_vlm()
+                if freed:
+                    # Put the LLM back (~35 s) without making the user wait for it.
+                    threading.Thread(target=self.warm_up, daemon=True).start()
 
             # Preserve user/assistant alternation if any error path bailed.
             if not assistant_appended:

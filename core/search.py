@@ -6,6 +6,79 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_WEATHER_LOCATION = "Brantford"
+# "in the morning", "in an hour"... are times, not places.
+_NOT_PLACES = ("the ", "a ", "an ", "my ", "this ", "next ", "today", "tomorrow", "tonight",
+               "morning", "afternoon", "evening", "here", "outside")
+
+
+def _weather_location(query_lower: str) -> str:
+    if " in " not in f" {query_lower}":
+        return DEFAULT_WEATHER_LOCATION
+    place = f" {query_lower}".split(" in ", 1)[1]
+    place = place.split(",")[0].split("?")[0].split(" today")[0].split(" tomorrow")[0].strip(" .!")
+    if not place or place.startswith(_NOT_PLACES) or len(place.split()) > 3:
+        return DEFAULT_WEATHER_LOCATION
+    return place
+
+
+def _day_stats(day: dict) -> dict:
+    """One day from wttr.in j1 JSON: daytime condition, high/low (int °C), rain chance."""
+    daytime = [h for h in day["hourly"] if 900 <= int(h["time"]) <= 1800] or day["hourly"]
+    descs = [h["weatherDesc"][0]["value"].strip() for h in daytime]
+    codes = {h["weatherDesc"][0]["value"].strip(): h.get("weatherCode") for h in daytime}
+    desc = max(set(descs), key=descs.count)
+    return {"date": day["date"], "desc": desc, "code": codes.get(desc),
+            "high": int(day["maxtempC"]), "low": int(day["mintempC"]),
+            "rain": max(int(h.get("chanceofrain", 0)) for h in daytime)}
+
+
+def _day_summary(day: dict) -> str:
+    d = _day_stats(day)
+    return f"{d['desc']}, high {d['high']}°C, low {d['low']}°C, {d['rain']}% chance of rain"
+
+
+def fetch_j1(location: str, timeout: float = 5):
+    """Raw wttr.in j1 JSON (metric) for `location`, or None on any failure."""
+    import requests
+    try:
+        resp = requests.get(f"https://wttr.in/{location.replace(' ', '+')}?format=j1&m", timeout=timeout)
+        if resp.status_code != 200:
+            return None
+        return resp.json()
+    except Exception as e:
+        logger.warning(f"wttr.in Weather Error: {e}")
+        return None
+
+
+def get_weather(query: str):
+    """Current conditions + 3-day forecast as ONE short line, or None on failure.
+
+    Kept to ~300 chars on purpose: the old wttr.in v2 table was ~18k chars of
+    ASCII art that a 1.7B model can't read and that overflows hailo-ollama's
+    ~2k-token context (the request is silently dropped).  Includes tomorrow so
+    "what's it doing tomorrow?" gets real data instead of an invented answer."""
+    import datetime
+    location = _weather_location(query.lower())
+    data = fetch_j1(location)
+    if data is None:
+        return None
+    try:
+        now = data["current_condition"][0]
+        days = data["weather"]
+        parts = [f"Weather in {location.title()}: now {now['weatherDesc'][0]['value'].strip()}, "
+                 f"{now['temp_C']}°C (feels like {now['FeelsLikeC']}°C)"]
+        labels = ["Today", "Tomorrow"]
+        for i, day in enumerate(days[:3]):
+            label = labels[i] if i < 2 else datetime.date.fromisoformat(day["date"]).strftime("%A")
+            parts.append(f"{label}: {_day_summary(day)}")
+        logger.info(f"Weather fetched from wttr.in: {location}")
+        return ". ".join(parts) + "."
+    except Exception as e:
+        logger.warning(f"wttr.in Weather Error: {e}")
+        return None
+
+
 def search_web(query: str) -> str:
     """
     Searches DuckDuckGo for the given query and returns a summary of the top result.
@@ -16,34 +89,10 @@ def search_web(query: str) -> str:
     
     # 0. Special Case: Weather
     if "weather" in query_lower:
-        # Extract the location by dropping the question/filler words, not by
-        # requiring the word "in" — "Weather Toronto" has no "in" and used to
-        # silently fall back to the default city.
-        location = "Brantford"  # Default
-        import re as _re
-        cand = query_lower
-        # Word-boundary removal so "the" doesn't mangle "weather" -> "wea r".
-        cand = _re.sub(r"\b(what's|what is|whats|tell me|the|weather|forecast|"
-                       r"like|today|tonight|tomorrow|please|in|at|for)\b", " ", cand)
-        cand = _re.sub(r"[?!.,]", " ", cand)
-        cand = " ".join(cand.split())  # collapse whitespace
-        if cand:
-            location = cand.replace(" ", "+")
-        
-        try:
-            import requests
-            # Compact one-line summary ("Sunny +23C 76% ...").  The v2 ASCII-art
-            # table is ~16 KB of box-drawing + ANSI colour that crashes
-            # hailo-ollama's strict JSON prompt renderer when injected upstream.
-            url = f"https://wttr.in/{location}?format=4"
-            resp = requests.get(url, timeout=10)
-            if resp.status_code == 200:
-                result = f"LIVE WEATHER DATA for {location}: {resp.text.strip()}"
-                logger.info(f"Weather fetched from wttr.in: {location}")
-                return result
-        except Exception as e:
-            logger.warning(f"wttr.in Weather Error: {e}")
-            # Fall through to DDG if wttr.in fails
+        weather = get_weather(query)
+        if weather:
+            return weather
+        # Fall through to DDG if wttr.in fails
 
     try:
         with DDGS(timeout=10) as ddgs:
