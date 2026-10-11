@@ -3121,7 +3121,7 @@ class BotGUI:
         
         # Fallback phrases if search/LLM fails
         fallback_phrases = [
-            "I wonder what Finn and Jake are doing right now.",
+            "I wonder what Sancho is doing right now.",
             "Does anyone want to play a video game? No? ...Okay.",
             "La la la la la... BMO is the best!",
             "Sometimes BMO just likes to hum a little tune.",
