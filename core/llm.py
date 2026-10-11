@@ -95,6 +95,50 @@ def delegate_to_hermes(prompt: str) -> str:
         out = "My big friend Hermes didn't say anything back."
     print(f"[HERMES] Got {len(out)} chars from Hermes.")
     return out
+
+# Tiny on-NPU qwen3 often shrugs ("I don't know" / "I can't answer") on anything
+# outside its tiny training envelope.  Rather than leave the user with a dead-end,
+# detect those shrugs and hand the turn to Hermes (richer model + tools).
+# Word-boundary patterns only — a real answer like "the capital is Paris" must
+# never trip this.
+_CANT_ANSWER_PATTERNS = [
+    re.compile(r"\bdon'?t\s+know\b", re.IGNORECASE),
+    re.compile(r"\bdo\s+not\s+know\b", re.IGNORECASE),
+    re.compile(r"\bdoesn'?t\s+know\b", re.IGNORECASE),
+    re.compile(r"\bdoes\s+not\s+know\b", re.IGNORECASE),
+    re.compile(r"\bcan'?t\s+answer\b", re.IGNORECASE),
+    re.compile(r"\bcannot\s+answer\b", re.IGNORECASE),
+    re.compile(r"\bcan\s+not\s+answer\b", re.IGNORECASE),
+    re.compile(r"\bcouldn'?t\s+(?:tell|say|answer)\b", re.IGNORECASE),
+    re.compile(r"\b(?:have|has|got)\s+no\s+idea\b", re.IGNORECASE),
+    re.compile(r"\bi'?m\s+not\s+sure\b", re.IGNORECASE),
+]
+
+# Spoken hand-off line when BMO comes up empty and Hermes takes over.  Chosen at
+# random so repeated shut-outs don't sound robotic.  Keep ASCII-only (TTS + the
+# hailo-ollama renderer reject non-ASCII).
+_DELEGATION_PREFACES = [
+    "BMO came up with nothing. Let's try my big friend Hermes!",
+    "BMO drew a blank there. Let me ask Hermes!",
+    "BMO doesn't know that one. Let's see what Hermes says!",
+    "BMO is stumped. Let me hand that to Hermes!",
+    "BMO has no idea! Let me bring in Hermes.",
+]
+
+
+def _is_cant_answer(text: str) -> bool:
+    """True when a reply is essentially a shrug rather than an answer."""
+    if not text:
+        return False
+    return any(p.search(text) for p in _CANT_ANSWER_PATTERNS)
+
+
+def _delegation_preface() -> str:
+    """Return one spoken "BMO came up empty, let's try Hermes" variant."""
+    import random
+    return random.choice(_DELEGATION_PREFACES)
+
+
 from .timers import (describe_duration, describe_when, match_reminders, parse_reminder_query,
                      parse_reminder_request, parse_timer_request)
 from .briefing import intents as briefing_intents
@@ -1170,6 +1214,14 @@ class Brain:
                 if not content.strip():
                     content = "BMO is here! How can I help?"
 
+                # Tiny-BMO shrug ("I don't know" / "I can't answer") -> hand the
+                # turn to Hermes so the user isn't left with a dead-end.
+                if _is_cant_answer(content):
+                    print("[HERMES] BMO came up empty — delegating follow-up to Hermes.")
+                    hermes = delegate_to_hermes(user_text)
+                    # Prevent an empty/failed delegation from clobbering the shrug.
+                    content = f"{_delegation_preface()} {hermes}".strip() if hermes else content
+
                 self.history.append({"role": "assistant", "content": _history_safe(content)})
                 assistant_appended = True
 
@@ -1475,7 +1527,21 @@ class Brain:
                     if final_action is not None and "action" in final_action:
                         # For advanced tool use we won't yield the json action to TTS
                         pass
-                    
+
+                    # Tiny-BMO shrug ("I don't know" / "I can't answer") -> hand the
+                    # turn to Hermes (mirrors think()).  The shrug was already spoken
+                    # while streaming; follow it with the hand-off line + Hermes' answer.
+                    spoken = strip_think_blocks(full_content) or full_content
+                    if _is_cant_answer(spoken):
+                        print("[HERMES-STREAM] BMO came up empty — delegating to Hermes.")
+                        preface = _delegation_preface()
+                        yield preface
+                        hermes = delegate_to_hermes(user_text)
+                        if hermes:
+                            yield hermes
+                            raw_content = f"{preface} {hermes}".strip()
+                        # else: keep the shrug as-is; no Hermes answer to record.
+
                     self.history.append({"role": "assistant", "content": _history_safe(raw_content)})
                     assistant_appended = True
                     self.save_history()
