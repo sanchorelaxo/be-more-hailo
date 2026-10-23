@@ -38,25 +38,29 @@ UNKNOWN_LABELS = {"", "unknown", "none", "null"}
 
 # --- intents ---------------------------------------------------------------------
 
-# Recognition ("who is this?") only.  Vision questions ("do you see me?",
-# "who do you see?", "what is this?") belong to the camera/VLM route and must
-# never arrive here: those ask *what* is in view, not *who* it is.  Keep this
-# list free of the camera keywords in core/llm.py.
+# Recognition is opt-in on one word: the utterance has to contain "recognize"
+# (or "recognise").  Owner's rule — no word, no scan — because the alternative is
+# the 1.7B model answering identity questions out of the chat history and making
+# a name up: "Recognize me." once missed this list and came back as the *old*
+# label.  Any sentence carrying the word counts, wherever it sits.
+#
+# This also keeps "who do you see?" / "what is this?" on the camera/VLM route:
+# asking what is in view is not asking who it is.
 _RECOGNIZE_PATTERNS = [
-    r"\bdo you (?:recogni[sz]e|know) me\b",
-    r"\bdo you know who i am\b",
-    r"\bdo you remember (?:me|my face)\b",
-    r"\bwho am i\b",
-    r"\bwho(?:'s| is) (?:that|this)\b",
-    r"\bcan you recogni[sz]e my face\b",
+    r"\brecogni[sz]e\b",
 ]
 
-# "enroll my face", "register this face as Rob", "remember my face", "enroll me"
+# "enroll my face", "register this face as Rob", "hold this face as anonymous",
+# "remember my face", "enroll me"
 _ENROLL_PATTERNS = [
-    r"\b(?:enroll|enrol|register|remember|save|learn|store)\s+(?:my|this|that|his|her)\s+face\b",
-    r"\b(?:enroll|enrol|register|remember|save|learn|store)\s+me\b",
+    r"\b(?:enroll|enrol|register|remember|save|learn|store|add|hold|memori[sz]e)"
+    r"\s+(?:my|this|that|his|her)\s+face\b",
+    r"\b(?:enroll|enrol|register|remember|save|learn|store|add|hold|memori[sz]e)\s+me\b",
     r"\bput my face in (?:your|the) (?:memory|database|list)\b",
 ]
+
+# "do you…", "can you…", "would you…" — a question, never an instruction.
+_QUESTION_OPENER = re.compile(r"^\s*(?:so,?\s*)?(?:do|can|could|would|will|are|is|did|have)\s+you\b", re.I)
 
 _NAME_AS = re.compile(r"\bas\s+([A-Za-z][A-Za-z .'-]{0,40})", re.I)
 _NAME_IS = re.compile(r"\b(?:my name is|i am|i'm)\s+([A-Za-z][A-Za-z .'-]{0,40})", re.I)
@@ -92,6 +96,10 @@ def match_face_intent(text: str) -> "tuple[str, str | None] | None":
     for pattern in _RECOGNIZE_PATTERNS:
         if re.search(pattern, low):
             return ("recognize", None)
+    # An interrogative is asking whether BMO *can* remember, not asking it to
+    # learn a face: "do you remember my face?" must not start an enrollment.
+    if _QUESTION_OPENER.match(low):
+        return None
     for pattern in _ENROLL_PATTERNS:
         if re.search(pattern, low):
             return ("enroll", _extract_name(text))

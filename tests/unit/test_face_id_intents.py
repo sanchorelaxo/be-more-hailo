@@ -7,11 +7,32 @@ half — every branch must produce something BMO can actually say.
 from core.face_id import match_face_intent, describe, parse_name_reply
 
 
-def test_recognize_phrasings():
-    for text in ("do you recognize me", "Do you recognise me?", "do you know me",
-                 "who am i", "do you know who I am", "who is that",
-                 "can you recognize my face", "do you remember me"):
+def test_recognize_needs_the_word_recognize():
+    """The trigger is the word itself, wherever it sits in the sentence.
+
+    On the robot "Recognize me." missed the old pattern list, fell through to the
+    1.7B model and came back with a name from the chat history — the one thing a
+    face query must never do is invent an answer.
+    """
+    for text in ("do you recognize me", "Do you recognise me?", "recognize me.",
+                 "Recognise me", "recognize me please", "recognize this face",
+                 "can you recognise the person in front of you?",
+                 "do you recognise whoever is standing here",
+                 "guess what, recognize me now"):
         assert match_face_intent(text) == ("recognize", None), text
+
+
+def test_without_the_word_recognize_it_is_not_recognition():
+    """A deliberate rule: no "recognize", no scan.
+
+    "who am i" / "do you know me" used to route here. They must not any more —
+    the robot only looks at the camera when it is asked to recognize.
+    """
+    for text in ("who am i", "do you know me", "do you know who i am",
+                 "who is that", "who is it", "what's my name", "identify me",
+                 "do you remember me", "do you remember my face",
+                 "can you tell me who i am"):
+        assert match_face_intent(text) is None, text
 
 
 def test_enroll_phrasings():
@@ -26,6 +47,16 @@ def test_enroll_with_name():
     assert match_face_intent("enroll my face as Robert") == ("enroll", "Robert")
     assert match_face_intent("register this face as Mary Jane") == ("enroll", "Mary Jane")
     assert match_face_intent("my name is Robert, enroll my face") == ("enroll", "Robert")
+    assert match_face_intent("enroll this face as Johnny Knuckles") == (
+        "enroll", "Johnny Knuckles")
+
+
+def test_enroll_verbs_people_actually_use():
+    """"Hold this face as anonymous" was said to the robot and went to the LLM."""
+    assert match_face_intent("hold this face as anonymous") == ("enroll", "anonymous")
+    assert match_face_intent("learn this face as Rob") == ("enroll", "Rob")
+    assert match_face_intent("add my face as Rob") == ("enroll", "Rob")
+    assert match_face_intent("memorize this face as Rob") == ("enroll", "Rob")
 
 
 def test_name_tail_is_not_a_name():

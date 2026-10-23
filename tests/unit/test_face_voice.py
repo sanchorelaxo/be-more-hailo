@@ -86,8 +86,37 @@ def test_face_result_is_also_streamed():
     assert "Robert" in text
 
 
-@pytest.mark.parametrize("line", ["who am i", "do you know me", "do you remember me"])
+@pytest.mark.parametrize("line", ["Recognize me.", "do you recognize me",
+                                  "recognise me please"])
 def test_common_phrasings_reach_the_face_route(line):
     face = FakeFace()
     brain(face).think(line)
     assert face.calls == [("recognize",)]
+
+
+@pytest.mark.parametrize("line", ["who am i", "do you know me", "what's my name"])
+def test_without_recognize_the_camera_is_not_used(line):
+    face = FakeFace()
+    brain(face).think(line)
+    assert face.calls == []
+
+
+@pytest.mark.parametrize("line", ["can you recognise the person in front of you?",
+                                  "do you recognise whoever is standing here"])
+def test_identity_questions_never_reach_the_llm(line):
+    """The model invented "you're Johnny Knuckles" when a phrasing missed.
+
+    Whatever the wording, an utterance that asks the robot to recognise someone
+    must be answered by the face app or not at all — never confabulated from the
+    chat history.
+    """
+    face = FakeFace()
+    brain(face).think(line)
+    assert face.calls == [("recognize",)]
+
+
+def test_a_question_about_remembering_never_enrolls():
+    """"Do you remember my face?" asks a question; it must not start an enroll."""
+    face = FakeFace()
+    assert brain(face)._face_action("do you remember my face?") is None
+    assert face.calls == []
