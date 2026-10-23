@@ -158,7 +158,73 @@ def _is_hermes_request(text: str) -> bool:
     return _extract_skill_request(text) is not None
 
 
-def delegate_to_hermes(prompt: str, skill: str | None = None) -> str:
+def _normalise_ask(text: str) -> str:
+    """Case/space/punctuation-insensitive form used to spot a duplicated ask."""
+    return re.sub(r"[\s.!?,;:]+$", "", " ".join((text or "").lower().split())).strip()
+
+
+def _ascii_only(text: str) -> str:
+    """Drop non-ASCII: the Pi locale may be C and hailo-ollama rejects it."""
+    return text.encode("ascii", "ignore").decode("ascii")
+
+
+def _delegation_context(history: list | None, current: str | None = None,
+                        max_messages: int | None = None,
+                        max_chars: int | None = None) -> str:
+    """Render BMO's recent conversation as a compact, ASCII-only transcript.
+
+    Delegation shells out to a cold `hermes -z` one-shot, so without this the
+    delegated turn has no idea what was just said — a follow-up like "repeat
+    the last answer" gets answered from Hermes' own stale session instead.
+    The system prompt is never included, the current request is de-duplicated
+    (``think()`` appends the user turn before delegating), and the window is
+    bounded both by message count and total characters, newest first.
+    """
+    from .config import (HERMES_DELEGATE_HISTORY_MESSAGES,
+                         HERMES_DELEGATE_HISTORY_CHARS,
+                         HERMES_DELEGATE_HISTORY_MSG_CHARS)
+
+    if not history:
+        return ""
+    max_messages = max_messages or HERMES_DELEGATE_HISTORY_MESSAGES
+    max_chars = max_chars or HERMES_DELEGATE_HISTORY_CHARS
+
+    msgs = [m for m in history
+            if isinstance(m, dict) and m.get("role") != "system"]
+    if current and msgs:
+        last = msgs[-1]
+        if last.get("role") == "user" and _normalise_ask(
+            last.get("content") or "") == _normalise_ask(current):
+            msgs = msgs[:-1]
+    msgs = msgs[-max_messages:]
+
+    lines = []
+    for m in msgs:
+        text = (m.get("content") or "").strip()
+        if not text:
+            continue
+        text = text[:HERMES_DELEGATE_HISTORY_MSG_CHARS]
+        speaker = "User" if m.get("role") == "user" else "BMO"
+        lines.append(f"{speaker}: {text}")
+
+    kept: list[str] = []
+    total = 0
+    for line in reversed(lines):
+        if kept and total + len(line) + 1 > max_chars:
+            break
+        kept.append(line)
+        total += len(line) + 1
+    kept.reverse()
+    if not kept:
+        return ""
+    ctx = "\n".join(kept)
+    if len(kept) < len(lines):
+        ctx = "[earlier turns omitted]\n" + ctx
+    return _ascii_only(ctx)
+
+
+def delegate_to_hermes(prompt: str, skill: str | None = None,
+                       history: list | None = None) -> str:
     """Run `hermes -z <prompt>` locally and return its answer.
 
     Shells out to the Raspberry Pi's own Hermes Agent CLI (richer model + tools
@@ -171,6 +237,12 @@ def delegate_to_hermes(prompt: str, skill: str | None = None) -> str:
     skill is resolved and preloaded in the Hermes session (``-s <name>``) and
     named in the prompt, so Hermes actually uses it.  Pass ``skill`` to
     override the resolution.
+
+    ``history`` is BMO's own ``Brain.history``.  Each call is a cold one-shot,
+    so the recent turns are rendered into the prompt (see
+    ``_delegation_context``) — otherwise follow-ups like "repeat the last
+    answer" are answered from Hermes' stale session instead of what was just
+    spoken.
     """
     from .config import HERMES_DELEGATE_MODEL, HERMES_DELEGATE_TIMEOUT, HERMES_DELEGATE_SUCCINCT
     import subprocess, shlex
@@ -195,6 +267,19 @@ def delegate_to_hermes(prompt: str, skill: str | None = None) -> str:
         p = prompt.strip()
     if skill:
         p = f'Use the "{skill}" skill to answer this. {p}'
+
+    # Carry BMO's own conversation into the one-shot: without it a follow-up
+    # ("repeat the last answer") is answered from Hermes' stale session.
+    ctx = _delegation_context(history, current=prompt)
+    if ctx:
+        p = (
+            "Recent conversation between the user and BMO, oldest first:\n"
+            f"{ctx}\n\n"
+            "Continue from this conversation. Ignore any unrelated or older "
+            "conversation you may remember; only the turns above are relevant.\n\n"
+            f"Current request: {p}"
+        )
+
     # Keep the delegated response short (protects KV cache + shortens TTS).
     if HERMES_DELEGATE_SUCCINCT:
         p = f"{HERMES_DELEGATE_SUCCINCT} {p}"
@@ -1133,7 +1218,7 @@ class Brain:
         # "use hermes ..." keyword and the "use the <x> skill ..." form.
         if _is_hermes_request(user_text):
             print("[HERMES] Trigger matched — delegating to local Hermes Agent.")
-            answer = delegate_to_hermes(user_text)
+            answer = delegate_to_hermes(user_text, history=self.history)
             if answer:
                 self.history.append({"role": "assistant", "content": answer})
                 self.save_history()
@@ -1358,7 +1443,7 @@ class Brain:
                 # turn to Hermes so the user isn't left with a dead-end.
                 if _is_cant_answer(content):
                     print("[HERMES] BMO came up empty — delegating follow-up to Hermes.")
-                    hermes = delegate_to_hermes(user_text)
+                    hermes = delegate_to_hermes(user_text, history=self.history)
                     # Prevent an empty/failed delegation from clobbering the shrug.
                     content = f"{_delegation_preface()} {hermes}".strip() if hermes else content
 
@@ -1417,7 +1502,7 @@ class Brain:
         # Blocks (with a timeout) until the delegated query finishes — BMO waits.
         if _is_hermes_request(user_text):
             print("[HERMES] Trigger matched — delegating to local Hermes Agent.")
-            answer = delegate_to_hermes(user_text)
+            answer = delegate_to_hermes(user_text, history=self.history)
             if answer:
                 self.history.append({"role": "assistant", "content": answer})
                 self.save_history()
@@ -1677,7 +1762,7 @@ class Brain:
                         print("[HERMES-STREAM] BMO came up empty — delegating to Hermes.")
                         preface = _delegation_preface()
                         yield preface
-                        hermes = delegate_to_hermes(user_text)
+                        hermes = delegate_to_hermes(user_text, history=self.history)
                         if hermes:
                             yield hermes
                             raw_content = f"{preface} {hermes}".strip()

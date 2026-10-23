@@ -30,6 +30,13 @@ HERMES_DELEGATE_TIMEOUT = int(os.environ.get("HERMES_DELEGATE_TIMEOUT", "180"))
 # Prepend this instruction to every delegated query.  Keeps one-shot responses
 # short (protects BMO's small KV cache and shortens TTS).  Set to "" to disable.
 HERMES_DELEGATE_SUCCINCT = os.environ.get("HERMES_DELEGATE_SUCCINCT", "Be ultra-succinct. Keep your answer to one or two short sentences.")
+
+# Delegated turns are cold `hermes -z` one-shots, so BMO's own recent
+# conversation is summarised into the prompt.  These cap that window (message
+# count and characters) to keep the delegated prompt small and predictable.
+HERMES_DELEGATE_HISTORY_MESSAGES = int(os.environ.get("HERMES_DELEGATE_HISTORY_MESSAGES", "6"))
+HERMES_DELEGATE_HISTORY_CHARS = int(os.environ.get("HERMES_DELEGATE_HISTORY_CHARS", "2000"))
+HERMES_DELEGATE_HISTORY_MSG_CHARS = int(os.environ.get("HERMES_DELEGATE_HISTORY_MSG_CHARS", "500"))
 # "use <x> skill" delegation: the skill the user names is fuzzy-matched against
 # the skills installed for this machine's Hermes (~/.hermes/skills) and the
 # winner is preloaded with `hermes -s <skill>`.  Raise the cutoff to demand a

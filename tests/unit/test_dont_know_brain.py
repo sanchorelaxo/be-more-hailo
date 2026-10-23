@@ -42,7 +42,7 @@ def test_think_delegates_on_dont_know(monkeypatch):
     delegated = []
     monkeypatch.setattr(llm.requests, "post", lambda *a, **k: _Resp("I don't know, friend!"))
     monkeypatch.setattr(llm, "delegate_to_hermes",
-                        lambda prompt: delegated.append(prompt) or "The capital of Australia is Canberra.")
+                        lambda prompt, **kw: delegated.append(prompt) or "The capital of Australia is Canberra.")
     out = _brain().think("What is the capital of Australia?")
     assert any(out.startswith(p) for p in llm._DELEGATION_PREFACES)
     assert "Canberra" in out
@@ -53,7 +53,7 @@ def test_think_does_not_delegate_on_real_answer(monkeypatch):
     delegated = []
     monkeypatch.setattr(llm.requests, "post", lambda *a, **k: _Resp("The capital of France is Paris!"))
     monkeypatch.setattr(llm, "delegate_to_hermes",
-                        lambda prompt: delegated.append(prompt) or "unused")
+                        lambda prompt, **kw: delegated.append(prompt) or "unused")
     out = _brain().think("What is the capital of France?")
     assert "Paris" in out
     assert delegated == []
@@ -63,7 +63,7 @@ def test_stream_think_delegates_on_cant_answer(monkeypatch):
     delegated = []
     monkeypatch.setattr(llm.requests, "post", lambda *a, **k: _StreamResp("I can't answer that, friend."))
     monkeypatch.setattr(llm, "delegate_to_hermes",
-                        lambda prompt: delegated.append(prompt) or "The capital of Australia is Canberra.")
+                        lambda prompt, **kw: delegated.append(prompt) or "The capital of Australia is Canberra.")
     yielded = list(_brain().stream_think("What is the capital of Australia?"))
     joined = " | ".join(yielded)
     assert "Canberra" in joined
@@ -75,7 +75,7 @@ def test_stream_think_does_not_delegate_on_real_answer(monkeypatch):
     delegated = []
     monkeypatch.setattr(llm.requests, "post", lambda *a, **k: _StreamResp("Paris is the capital of France."))
     monkeypatch.setattr(llm, "delegate_to_hermes",
-                        lambda prompt: delegated.append(prompt) or "unused")
+                        lambda prompt, **kw: delegated.append(prompt) or "unused")
     yielded = list(_brain().stream_think("What is the capital of France?"))
     assert "Paris" in " ".join(yielded)
     assert delegated == []
