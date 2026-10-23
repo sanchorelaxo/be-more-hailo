@@ -170,6 +170,10 @@ def describe(result: dict, command: str = "recognize") -> str:
         label = result.get("label") or "you"
         samples = result.get("samples") or 1
         looks = f" from {samples} looks" if samples > 1 else ""
+        if result.get("merged"):  # same face, older name — say where it went
+            old = ", ".join(str(name) for name in result["merged"])
+            return (f"Got it! I used to know that face as {old}, so I moved it over to "
+                    f"{label}{looks}.")
         if result.get("replaced"):
             return (f"Got it! I knew that face as {label}, but I updated it{looks} — "
                     "so it should recognise you better now.")

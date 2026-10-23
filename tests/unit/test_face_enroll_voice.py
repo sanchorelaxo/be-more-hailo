@@ -12,6 +12,7 @@ The guard stays for a human at a shell; a caller that has already freed the NPU
 and the camera (``FaceID``) announces itself with ``BMO_FACE_AGENT_HANDOFF=1``.
 """
 import importlib.util
+import json
 import pathlib
 import sys
 import types
@@ -173,6 +174,42 @@ def test_recognition_also_announces_the_handoff():
     assert face._env()["BMO_FACE_AGENT_HANDOFF"] == "1"
 
 
+# --- one face, one name ---------------------------------------------------------------
+
+def twin_db(label="Johnny Montana", embedding=None):
+    """A second record holding (nearly) the same face under another name."""
+    emb = embedding if embedding is not None else [0.51] * 8
+    rec = {"global_id": "twin-id", "label": label,
+           "samples_json": json.dumps([{"id": "t1", "sample_path": "/tmp/t.jpg",
+                                        "embedding": emb}])}
+    return FakeDB(existing=[rec])
+
+
+def test_replace_folds_a_second_label_for_the_same_face(cli, monkeypatch):
+    db = twin_db()
+    wire(cli, monkeypatch, db, [face_event(cli, 1.0), face_event(cli, 1.5)])
+    out = cli.cmd_enroll(enroll_args(cli, replace=True), module=None, Pipeline=None)
+    assert out["ok"] is True
+    assert "twin-id" in db.deleted
+    assert out["merged"] == ["Johnny Montana"]
+
+
+def test_a_different_face_is_not_folded(cli, monkeypatch):
+    db = twin_db(label="Someone Else", embedding=[-0.5] * 8)
+    wire(cli, monkeypatch, db, [face_event(cli, 1.0), face_event(cli, 1.5)])
+    out = cli.cmd_enroll(enroll_args(cli, replace=True), module=None, Pipeline=None)
+    assert db.deleted == []
+    assert out["merged"] == []
+
+
+def test_without_replace_the_other_name_is_only_reported(cli, monkeypatch):
+    db = twin_db()
+    wire(cli, monkeypatch, db, [face_event(cli, 1.0), face_event(cli, 1.5)])
+    out = cli.cmd_enroll(enroll_args(cli), module=None, Pipeline=None)
+    assert db.deleted == []
+    assert out["looks_like"] == ["Johnny Montana"]
+
+
 # --- the camera loan has to be visible to the agent ---------------------------------
 
 def _face(monkeypatch, run):
@@ -210,6 +247,16 @@ def test_busy_clears_when_the_helper_raises():
 
 
 # --- what BMO says ------------------------------------------------------------------
+
+def test_a_folded_name_is_spoken_as_a_move():
+    """Saying a new name for a known face must not leave a riddle on the table."""
+    from core.face_id import describe
+
+    said = describe({"ok": True, "label": "Johnny Knuckles", "samples": 3,
+                     "merged": ["Johnny Montana"]}, "enroll")
+    assert "Johnny Montana" in said and "Johnny Knuckles" in said
+    assert "moved" in said or "moved it over" in said
+
 
 def test_replace_is_spoken_as_an_update():
     from core.face_id import describe

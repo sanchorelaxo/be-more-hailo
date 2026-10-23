@@ -39,6 +39,9 @@ DEFAULT_UDP_PORT = 5199
 HAILO_ENV_FILE = "/usr/local/hailo/resources/.env"
 UNKNOWN = {"", "unknown", "none", "null"}
 MIN_DETECTION_CONFIDENCE = 0.55
+# The app's own recognition threshold: at or above this the app already calls it
+# the same person, so a second label describing the same face must be folded in.
+SAME_FACE_SIM = 0.7
 # Boxes are normalised 0..1; anything under 0.5% of the frame is background
 # clutter (a face on a poster, a reflection), not the person talking to BMO.
 MIN_FACE_AREA = 0.005
@@ -399,8 +402,14 @@ def cmd_enroll(args, module, Pipeline) -> dict:
     if existing and not args.replace:
         return {"ok": False, "reason": "already_enrolled", "label": args.name,
                 "seconds": round(time.time() - started, 1)}
+    twins = _same_face_elsewhere(db, args.name, best["embedding"])
     for old in existing:  # --replace: a stale/ badly-posed record is dropped whole
         db.delete_record(old["global_id"])
+    merged = []
+    if args.replace:  # ...and so is the same face filed under an older name
+        for twin, _sim in twins:
+            db.delete_record(twin["global_id"])
+            merged.append(twin.get("label"))
     record = db.create_record(
         embedding=np.asarray(best["embedding"], dtype="float32"),
         sample=sample,
@@ -421,6 +430,8 @@ def cmd_enroll(args, module, Pipeline) -> dict:
         "samples": len(picked),
         "global_id": record.get("global_id"),
         "replaced": bool(existing),
+        "merged": merged,
+        "looks_like": [twin.get("label") for twin, _sim in twins],
         "stored_samples": len(stored.get("samples_json") or []) if isinstance(
             stored.get("samples_json"), list) else None,
         "seconds": round(time.time() - started, 1),
@@ -437,6 +448,56 @@ def _record_for_update(db, record: dict) -> dict:
     return {**fresh, "samples_json": sample_list or []}
 
 
+def _record_embeddings(record: dict) -> list:
+    """Every stored sample vector of one person, ``samples_json`` parsed."""
+    import numpy as np
+
+    samples = (record or {}).get("samples_json") or []
+    if isinstance(samples, str):
+        try:
+            samples = json.loads(samples)
+        except Exception:
+            return []
+    out = []
+    for sample in samples if isinstance(samples, list) else []:
+        emb = sample.get("embedding") if isinstance(sample, dict) else None
+        if not emb:
+            continue
+        vec = np.asarray(emb, dtype="float32").ravel()
+        norm = float(np.linalg.norm(vec))
+        if norm > 1e-6 and vec.size:
+            out.append(vec / norm)
+    return out
+
+
+def _same_face_elsewhere(db, name: str, embedding, threshold: float = SAME_FACE_SIM) -> list:
+    """Other labels whose stored samples are this same face at recognition level.
+
+    Learning one face under two names is how BMO ends up calling you the wrong
+    one: both records match above 0.7 and the higher score wins.
+    """
+    import numpy as np
+
+    probe = np.asarray(embedding, dtype="float32").ravel()
+    norm = float(np.linalg.norm(probe))
+    if not norm:
+        return []
+    probe = probe / norm
+    twins = []
+    for record in _all_records(db):
+        label = ((record or {}).get("label") or "").strip()
+        if not label or label.lower() == name.lower() or label.lower() in UNKNOWN:
+            continue
+        stored = _record_embeddings(record)
+        if not stored:
+            continue
+        sim = float(np.mean([float(probe @ vec) for vec in stored]))
+        if sim >= threshold:
+            twins.append((record, sim))
+    twins.sort(key=lambda pair: pair[1], reverse=True)
+    return twins
+
+
 def _open_db(module, Pipeline, app_dir: str):
     """Path resolution only — no GStreamer, no NPU, so this is safe to call alone."""
     pipeline = Pipeline(module.FrameQueue(), module.FaceEventQueue(),
@@ -444,9 +505,13 @@ def _open_db(module, Pipeline, app_dir: str):
     return pipeline.get_db()
 
 
-def _find_records(db, name: str, exact: bool = True) -> list:
+def _all_records(db) -> list:
     records = db.get_all_records() or {}
-    values = records.values() if isinstance(records, dict) else records
+    return list(records.values()) if isinstance(records, dict) else list(records)
+
+
+def _find_records(db, name: str, exact: bool = True) -> list:
+    values = _all_records(db)
     out = []
     for record in values:
         label = (record or {}).get("label") or ""
