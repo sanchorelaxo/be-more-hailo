@@ -394,6 +394,21 @@ class BotGUI:
         except Exception as e:
             print(f"[HOME] Home Assistant disabled: {e}")
 
+        # Face recognition: the Pi's onboard Hailo face app, driven head-less by
+        # scripts/bmo_face.py.  FaceID borrows the camera we own here and frees
+        # the NPU around each run, so "do you recognize me" works while the rest
+        # of BMO keeps running.
+        try:
+            from core.face_id import FaceID
+            _face = FaceID(camera=self.camera)
+            if _face.available():
+                self.brain.face_id = _face
+                print("[FACE] Recognition enabled (onboard Hailo face app)")
+            else:
+                print(f"[FACE] Disabled: helper not installed ({_face.script})")
+        except Exception as e:
+            print(f"[FACE] Recognition disabled: {e}")
+
         self.load_animations()
         self.load_sounds()
         self.update_animation()
@@ -1806,6 +1821,14 @@ class BotGUI:
         presence = Presence(away_s=float(s.get("away_minutes", 10)) * 60)
         warned = False
         while not self.stop_event.is_set():
+            # The face helper borrows the camera (and frees the NPU) around a
+            # spoken "enroll this face as X".  Re-opening /dev/video0 from here
+            # mid-run starves it, so stand down until the loan is handed back.
+            face = getattr(self.brain, "face_id", None)
+            if face is not None and getattr(face, "busy", False):
+                if self.stop_event.wait(0.2):
+                    return
+                continue
             if not self.camera.running and not self.camera.start():
                 if not warned:
                     print("[PRESENCE] No camera; retrying every 10 minutes "
