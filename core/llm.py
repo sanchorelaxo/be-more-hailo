@@ -38,15 +38,139 @@ def _internet_available(timeout_s: float = 1.5) -> bool:
 # Trigger phrase that hands the turn to the local Hermes Agent instance.
 HERMES_TRIGGERS = ("use hermes", "ask hermes", "hermes, ", "hermes:")
 
+# Skill flavour of the same hand-off: "use the <name> skill [to] <ask>".
+# Saying this WITHOUT the word "hermes" still delegates — Hermes is asked to
+# preload (``-s``) the installed skill whose name is closest to what was said,
+# because voice transcription mangles names ("spotikach" -> "spotykach").
+SKILL_TRIGGER_RE = re.compile(
+    r"(?i)\buse\s+(?:the\s+|a\s+|an\s+|my\s+|your\s+)?"
+    r"(?P<skill>[a-z0-9][a-z0-9 ._\-]{0,60}?)\s+skills?\b"
+)
 
-def delegate_to_hermes(prompt: str) -> str:
-    """Run `hermes chat -q <prompt>` locally and return its answer.
+# Skill subdirectories that hold supporting material, not a skill of their own.
+_SKILL_SUPPORT_DIRS = {"references", "templates", "scripts", "assets", "images", "__pycache__"}
+
+
+def _normalise_skill_name(name: str) -> str:
+    """Lowercase + collapse punctuation/whitespace so 'hermes agent' == 'hermes-agent'."""
+    return re.sub(r"[^a-z0-9]+", " ", (name or "").lower()).strip()
+
+
+def _skill_frontmatter_name(skill_md: str) -> str | None:
+    """Pull ``name:`` out of a SKILL.md YAML frontmatter block (None if absent)."""
+    try:
+        with open(skill_md, "r", encoding="utf-8", errors="replace") as fh:
+            head = fh.read(2048)
+    except OSError:
+        return None
+    m = re.search(r"(?m)^name:\s*([^\s#]+)", head)
+    return m.group(1).strip().strip("'\"") if m else None
+
+
+def hermes_skill_names(skills_dir: "str | os.PathLike | None" = None) -> list[str]:
+    """Names of the skills installed for the Pi's Hermes Agent.
+
+    Walks ``HERMES_SKILLS_DIR`` (~/.hermes/skills) for SKILL.md files and
+    returns both the frontmatter name and the directory name, so a spoken
+    phrase can match either.  A missing directory yields [] — never raises.
+    """
+    if skills_dir is None:
+        from .config import HERMES_SKILLS_DIR
+        skills_dir = HERMES_SKILLS_DIR
+    root = os.fspath(skills_dir)
+    found: set[str] = set()
+    if not os.path.isdir(root):
+        return []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if not d.startswith(".") and d not in _SKILL_SUPPORT_DIRS]
+        if "SKILL.md" not in filenames:
+            continue
+        dir_name = os.path.basename(dirpath)
+        found.add(dir_name)
+        fm_name = _skill_frontmatter_name(os.path.join(dirpath, "SKILL.md"))
+        if fm_name:
+            found.add(fm_name)
+    return sorted(found)
+
+
+def _closest_skill(phrase: str, names: list[str]) -> str | None:
+    """Best installed-skill match for a spoken name, or None.
+
+    Tiers: exact normalised match, then substring either way, then a difflib
+    similarity pass at HERMES_SKILL_MATCH_CUTOFF (tolerates transcription
+    typos / partial names).
+    """
+    want = _normalise_skill_name(phrase)
+    if not want or not names:
+        return None
+    normalised = [(n, _normalise_skill_name(n)) for n in names]
+    for name, norm in normalised:
+        if norm == want:
+            return name
+    for name, norm in normalised:
+        if len(norm) >= 3 and (norm in want or want in norm):
+            return name
+    try:
+        from .config import HERMES_SKILL_MATCH_CUTOFF
+        cutoff = float(HERMES_SKILL_MATCH_CUTOFF)
+    except Exception:
+        cutoff = 0.6
+    import difflib
+    best_name, best_score = None, 0.0
+    for name, norm in normalised:
+        score = difflib.SequenceMatcher(None, want, norm).ratio()
+        if score < cutoff or score <= best_score:
+            continue
+        # Short words score deceptively high against unrelated short names
+        # ("video" vs "ideation"), so require a real shared prefix unless at
+        # least one of the two names is long enough to be distinctive.
+        if min(len(want), len(norm)) < 8 and len(os.path.commonprefix([want, norm])) < 3:
+            continue
+        best_name, best_score = name, score
+    return best_name
+
+
+def _extract_skill_request(text: str) -> "tuple[str, str] | None":
+    """Split "use the <x> skill to <ask>" into (skill phrase, remaining ask).
+
+    Returns None when the text carries no skill trigger.  The remaining ask
+    falls back to the whole text when the user only named a skill.
+    """
+    if not text:
+        return None
+    m = SKILL_TRIGGER_RE.search(text)
+    if not m:
+        return None
+    phrase = re.sub(r"\s+", " ", m.group("skill")).strip(" .,:;").lower()
+    if not phrase:
+        return None
+    ask = f"{text[:m.start()]} {text[m.end():]}"
+    ask = re.sub(r"\s+", " ", ask).strip(" .,:;-")
+    ask = re.sub(r"(?i)^to\s+", "", ask).strip()
+    return phrase, (ask or text.strip())
+
+
+def _is_hermes_request(text: str) -> bool:
+    """True when this turn belongs to the Hermes Agent (keyword OR skill trigger)."""
+    lower = (text or "").lower()
+    if any(t in lower for t in HERMES_TRIGGERS):
+        return True
+    return _extract_skill_request(text) is not None
+
+
+def delegate_to_hermes(prompt: str, skill: str | None = None) -> str:
+    """Run `hermes -z <prompt>` locally and return its answer.
 
     Shells out to the Raspberry Pi's own Hermes Agent CLI (richer model + tools
     than BMO's on-NPU qwen3).  Blocks until the delegated query finishes or
     HERMES_DELEGATE_TIMEOUT elapses.  Returns a string BMO can speak; never
     raises — any failure yields a graceful BMO-style apology so the turn
     survives a missing CLI / hung process / offline API.
+
+    When the prompt is a "use <name> skill" request, the closest installed
+    skill is resolved and preloaded in the Hermes session (``-s <name>``) and
+    named in the prompt, so Hermes actually uses it.  Pass ``skill`` to
+    override the resolution.
     """
     from .config import HERMES_DELEGATE_MODEL, HERMES_DELEGATE_TIMEOUT, HERMES_DELEGATE_SUCCINCT
     import subprocess, shlex
@@ -56,8 +180,21 @@ def delegate_to_hermes(prompt: str) -> str:
     for trig in HERMES_TRIGGERS:
         p = re.sub(r"(?i)^\s*" + re.escape(trig), "", p)
     p = p.strip().strip(":,")
+
+    # "use the <x> skill ..." -> preload the closest installed skill.
+    skill_request = _extract_skill_request(prompt)
+    if skill_request is not None:
+        phrase, ask = skill_request
+        if skill is None:
+            skill = _closest_skill(phrase, hermes_skill_names())
+        if skill:
+            p = ask  # Hermes gets the real ask; the skill is named explicitly below.
+        print(f"[HERMES] Skill request {phrase!r} -> {skill!r}")
+
     if not p:
         p = prompt.strip()
+    if skill:
+        p = f'Use the "{skill}" skill to answer this. {p}'
     # Keep the delegated response short (protects KV cache + shortens TTS).
     if HERMES_DELEGATE_SUCCINCT:
         p = f"{HERMES_DELEGATE_SUCCINCT} {p}"
@@ -66,6 +203,8 @@ def delegate_to_hermes(prompt: str) -> str:
         "hermes", "-z", p,          # global one-shot: prints ONLY the final response
         "-m", HERMES_DELEGATE_MODEL,
     ]
+    if skill:
+        cmd += ["-s", skill]        # preload the skill into the session
     print(f"[HERMES] Delegating: hermes -z {shlex.quote(p[:60])}...")
     try:
         proc = subprocess.run(
@@ -990,8 +1129,9 @@ class Brain:
 
         lower_text = user_text.lower()
 
-        # Pre-LLM Hermes delegation — same as stream_think
-        if any(t in lower_text for t in HERMES_TRIGGERS):
+        # Pre-LLM Hermes delegation — same as stream_think.  Covers both the
+        # "use hermes ..." keyword and the "use the <x> skill ..." form.
+        if _is_hermes_request(user_text):
             print("[HERMES] Trigger matched — delegating to local Hermes Agent.")
             answer = delegate_to_hermes(user_text)
             if answer:
@@ -1271,10 +1411,11 @@ class Brain:
 
         lower_text = user_text.lower()
 
-        # Pre-LLM Hermes delegation: "use hermes ..." hands the turn to the
-        # Pi's own Hermes Agent CLI and speaks its answer.  Blocks (with a
-        # timeout) until the delegated query finishes — BMO waits.
-        if any(t in lower_text for t in HERMES_TRIGGERS):
+        # Pre-LLM Hermes delegation: "use hermes ..." or "use the <x> skill ..."
+        # hands the turn to the Pi's own Hermes Agent CLI and speaks its answer.
+        # Skill requests additionally preload the closest installed skill.
+        # Blocks (with a timeout) until the delegated query finishes — BMO waits.
+        if _is_hermes_request(user_text):
             print("[HERMES] Trigger matched — delegating to local Hermes Agent.")
             answer = delegate_to_hermes(user_text)
             if answer:

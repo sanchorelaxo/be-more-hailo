@@ -30,6 +30,12 @@ HERMES_DELEGATE_TIMEOUT = int(os.environ.get("HERMES_DELEGATE_TIMEOUT", "180"))
 # Prepend this instruction to every delegated query.  Keeps one-shot responses
 # short (protects BMO's small KV cache and shortens TTS).  Set to "" to disable.
 HERMES_DELEGATE_SUCCINCT = os.environ.get("HERMES_DELEGATE_SUCCINCT", "Be ultra-succinct. Keep your answer to one or two short sentences.")
+# "use <x> skill" delegation: the skill the user names is fuzzy-matched against
+# the skills installed for this machine's Hermes (~/.hermes/skills) and the
+# winner is preloaded with `hermes -s <skill>`.  Raise the cutoff to demand a
+# closer name match, lower it to match sloppier transcription.
+HERMES_SKILLS_DIR = os.environ.get("HERMES_SKILLS_DIR", os.path.expanduser("~/.hermes/skills"))
+HERMES_SKILL_MATCH_CUTOFF = float(os.environ.get("HERMES_SKILL_MATCH_CUTOFF", "0.6"))
 VISION_MODEL = "qwen2-vl-instruct:2b" # Legacy Ollama name (unused — VLM runs via HailoRT directly)
 
 # VLM (Vision Language Model) Settings — uses HailoRT Python API directly
