@@ -250,3 +250,74 @@ def test_stream_think_forwards_history(monkeypatch):
     b = _brain()
     list(b.stream_think("use hermes to name three engines"))
     assert seen["history"] is not None
+
+
+# --------------------------------------------------------------------------
+# "the last answer" must be unambiguous — delegated AND local replies alike
+# --------------------------------------------------------------------------
+
+def test_most_recent_answer_is_marked():
+    ctx = llm._delegation_context([
+        {"role": "user", "content": "use the op-1 skill to summarise the tape engine"},
+        {"role": "assistant", "content": "TAPE ENGINE ANSWER"},
+        {"role": "user", "content": "use the op-1 skill to write a gorillas prompt"},
+        {"role": "assistant", "content": "GORILLAS ANSWER"},
+    ])
+    assert "BMO (most recent answer): GORILLAS ANSWER" in ctx
+    # Only the newest one is marked; older answers stay plain.
+    assert "BMO: TAPE ENGINE ANSWER" in ctx
+    assert ctx.count("most recent answer") == 1
+
+
+def test_a_local_non_delegated_reply_counts_as_most_recent():
+    # Alternating delegated / non-delegated turns: the last thing spoken may
+    # come from local qwen3, and a delegated "repeat that" must still get it.
+    ctx = llm._delegation_context([
+        {"role": "user", "content": "use the op-1 skill to summarise the tape engine"},
+        {"role": "assistant", "content": "TAPE ENGINE ANSWER"},
+        {"role": "user", "content": "tell me a fun fact about dogs"},
+        {"role": "assistant", "content": "DOGS ANSWER"},
+    ])
+    assert "BMO (most recent answer): DOGS ANSWER" in ctx
+    assert "BMO: TAPE ENGINE ANSWER" in ctx
+
+
+def test_marker_survives_budget_trimming():
+    ctx = llm._delegation_context([
+        {"role": "assistant", "content": "OLD " + "x" * 900},
+        {"role": "assistant", "content": "NEWEST ANSWER"},
+    ], max_chars=300)
+    assert "most recent answer): NEWEST ANSWER" in ctx
+
+
+def test_recall_instruction_tells_hermes_what_to_repeat(monkeypatch):
+    calls = _capture_delegate(monkeypatch)
+    llm.delegate_to_hermes(
+        "repeat the last answer",
+        history=[{"role": "assistant", "content": "GORILLAS ANSWER"}],
+    )
+    prompt = calls[0][2]
+    low = prompt.lower()
+    assert "asks you to repeat" in low
+    assert "most recent answer" in low
+    assert "never an earlier bmo line" in low
+    assert "GORILLAS ANSWER" in prompt
+
+
+def test_injected_timestamp_prefix_is_stripped():
+    ctx = llm._delegation_context([
+        {"role": "user", "content": "[Now: 04:37 PM, Friday, October 23, 2026] tell me a fun fact about dogs"},
+        {"role": "assistant", "content": "DOGS ANSWER"},
+    ])
+    assert "Now:" not in ctx
+    assert "User: tell me a fun fact about dogs" in ctx
+
+
+def test_timestamp_does_not_defeat_current_ask_dedupe():
+    ask = "repeat the last answer"
+    ctx = llm._delegation_context([
+        {"role": "user", "content": "tell me a fun fact about dogs"},
+        {"role": "assistant", "content": "DOGS ANSWER"},
+        {"role": "user", "content": "[Now: 04:37 PM, Friday, October 23, 2026] " + ask},
+    ], current=ask)
+    assert ctx.count("repeat the last answer") == 0

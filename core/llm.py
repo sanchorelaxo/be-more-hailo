@@ -168,6 +168,9 @@ def _ascii_only(text: str) -> str:
     return text.encode("ascii", "ignore").decode("ascii")
 
 
+_NOW_PREFIX_RE = re.compile(r"^\[Now:[^\]]*\]\s*")
+
+
 def _delegation_context(history: list | None, current: str | None = None,
                         max_messages: int | None = None,
                         max_chars: int | None = None) -> str:
@@ -189,8 +192,13 @@ def _delegation_context(history: list | None, current: str | None = None,
     max_messages = max_messages or HERMES_DELEGATE_HISTORY_MESSAGES
     max_chars = max_chars or HERMES_DELEGATE_HISTORY_CHARS
 
-    msgs = [m for m in history
+    # think() stamps each user turn with "[Now: ...]" for the local model; it is
+    # noise here and would defeat the current-ask de-duplication below.
+    msgs = [{"role": m.get("role"),
+             "content": _NOW_PREFIX_RE.sub("", m.get("content") or "").strip()}
+            for m in history
             if isinstance(m, dict) and m.get("role") != "system"]
+    msgs = [m for m in msgs if m["content"]]
     if current and msgs:
         last = msgs[-1]
         if last.get("role") == "user" and _normalise_ask(
@@ -217,6 +225,14 @@ def _delegation_context(history: list | None, current: str | None = None,
     kept.reverse()
     if not kept:
         return ""
+    # Label the last spoken reply: with several BMO answers in the window,
+    # a bare "repeat the last answer" is ambiguous and Hermes has been observed
+    # repeating an earlier one. The marker is applied after trimming so it can
+    # never be the line that falls off.
+    for i in range(len(kept) - 1, -1, -1):
+        if kept[i].startswith("BMO: "):
+            kept[i] = "BMO (most recent answer): " + kept[i][len("BMO: "):]
+            break
     ctx = "\n".join(kept)
     if len(kept) < len(lines):
         ctx = "[earlier turns omitted]\n" + ctx
@@ -276,7 +292,10 @@ def delegate_to_hermes(prompt: str, skill: str | None = None,
             "Recent conversation between the user and BMO, oldest first:\n"
             f"{ctx}\n\n"
             "Continue from this conversation. Ignore any unrelated or older "
-            "conversation you may remember; only the turns above are relevant.\n\n"
+            "conversation you may remember; only the turns above are relevant. "
+            "If the current request asks you to repeat, restate or recall the "
+            "last answer, echo the line labelled \"BMO (most recent answer)\" "
+            "verbatim - never an earlier BMO line.\n\n"
             f"Current request: {p}"
         )
 
