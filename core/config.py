@@ -45,6 +45,20 @@ HERMES_SKILLS_DIR = os.environ.get("HERMES_SKILLS_DIR", os.path.expanduser("~/.h
 HERMES_SKILL_MATCH_CUTOFF = float(os.environ.get("HERMES_SKILL_MATCH_CUTOFF", "0.6"))
 VISION_MODEL = "qwen2-vl-instruct:2b" # Legacy Ollama name (unused — VLM runs via HailoRT directly)
 
+# Face recognition — the onboard Hailo face app (~/face-recog-web) driven by
+# scripts/bmo_face.py.  That helper needs the hailo-apps venv (it imports
+# hailo_platform/GStreamer), the app dir for its pipeline + LanceDB store, and
+# the app dir on PYTHONPATH.
+FACE_APP_DIR = os.environ.get("BMO_FACE_APP_DIR", os.path.expanduser("~/face-recog-web"))
+FACE_SCRIPT = os.environ.get(
+    "BMO_FACE_SCRIPT", os.path.join(_PROJECT_ROOT, "scripts", "bmo_face.py"))
+FACE_PYTHON = os.environ.get(
+    "BMO_FACE_PYTHON", os.path.expanduser("~/hailo-apps/venv_hailo_apps/bin/python3"))
+# How long BMO watches the camera before answering.  Enroll needs a few clean
+# frames, recognise usually settles in 3-4 s once the pipeline is up.
+FACE_RECOGNIZE_TIMEOUT = float(os.environ.get("BMO_FACE_RECOGNIZE_TIMEOUT", "10"))
+FACE_ENROLL_TIMEOUT = float(os.environ.get("BMO_FACE_ENROLL_TIMEOUT", "18"))
+
 # VLM (Vision Language Model) Settings — uses HailoRT Python API directly
 # The HEF file is a precompiled model binary from Hailo's model zoo
 VLM_HEF_PATH = os.environ.get("VLM_HEF_PATH", os.path.join(_PROJECT_ROOT, "models", "Qwen3-VL-2B-Instruct.hef"))

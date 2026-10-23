@@ -11,6 +11,7 @@ import numpy as np
 from .config import LLM_URL, LLM_KEEP_ALIVE, LLM_MODEL, FAST_LLM_MODEL, VISION_MODEL, VLM_HEF_PATH, get_system_prompt, get_current_context
 from .tts import add_pronunciation
 from .search import get_weather, search_web, search_images
+from .face_id import describe as describe_face, match_face_intent, parse_name_reply
 
 def _internet_available(timeout_s: float = 1.5) -> bool:
     """Cheap offline gate for voice-turn web search.
@@ -1022,6 +1023,12 @@ class Brain:
         self.reminders = None
         # Set by the agent when settings.json has a home_assistant block.
         self.home = None
+        # Set by the agent: a core.face_id.FaceID (None without the onboard
+        # Hailo face app, or on desktop where there is no Pi camera).
+        self.face_id = None
+        # "enroll my face" carried no name — BMO asked, so the next utterance
+        # is the answer (see _face_action).
+        self._face_pending_name = False
         self.history = []
         if persist:
             self.load_history()
@@ -1203,6 +1210,43 @@ class Brain:
             return _end("; ".join(_describe_item(r) for r in hits[:4]))
         return _end(_describe_item(hits[0], lead=True))
 
+    def _face_action(self, user_text: str) -> str | None:
+        """Answer "do you recognize me?" / "enroll my face" from the Pi camera.
+
+        Handled in Python, like timers: the 1.7B model can't be trusted to emit
+        the right JSON, and the answer is a fact (who is in front of the camera),
+        not something to generate.  ``core.face_id`` frees the NPU and the camera
+        around the run and speaks through ``describe``.
+
+        Only recognition phrasings match.  Vision questions ("do you see me?",
+        "who do you see", "what is this") deliberately return None so they keep
+        their existing camera/VLM route — validating what is in view is a
+        different job from validating who it is.
+        """
+        face = getattr(self, "face_id", None)
+        if face is None:
+            return None
+        if getattr(self, "_face_pending_name", False):
+            self._face_pending_name = False
+            name = parse_name_reply(user_text)
+            if name:
+                print(f"[FACE] Enrolling from the name reply: {name!r}")
+                return describe_face(face.enroll(name), "enroll")
+
+        intent = match_face_intent(user_text)
+        if intent is None:
+            return None
+        command, name = intent
+        if command == "enroll" and not name:
+            self._face_pending_name = True
+            print("[FACE] Enroll requested with no name — asking.")
+            return describe_face({"ok": False, "reason": "needs_name"}, "enroll")
+
+        print(f"[FACE] {command} requested{'' if name is None else f' as {name!r}'}")
+        result = face.enroll(name) if command == "enroll" else face.recognize()
+        print(f"[FACE] Result: {result}")
+        return describe_face(result, command)
+
     def _instant_reply(self, user_text: str):
         """Answers that don't need the LLM: timer/reminder questions, time,
         date, days-until, maths, units, then Home Assistant commands (last:
@@ -1255,6 +1299,13 @@ class Brain:
             combined = " ".join(game)
             self.history.append({"role": "assistant", "content": combined})
             return combined
+
+        # Pre-LLM face check first: "do you see me?" is about *who*, and the
+        # camera list below would otherwise turn it into a photo request.
+        face_answer = self._face_action(user_text)
+        if face_answer is not None:
+            self.history.append({"role": "assistant", "content": face_answer})
+            return face_answer
 
         # Pre-LLM camera check — same logic as stream_think
         camera_keywords = [
@@ -1540,6 +1591,13 @@ class Brain:
             yield game[0]
             self.history.append({"role": "assistant", "content": " ".join(game)})
             yield game[1]
+            return
+
+        # Pre-LLM face check first (see think): "do you see me?" asks who.
+        face_answer = self._face_action(user_text)
+        if face_answer is not None:
+            self.history.append({"role": "assistant", "content": face_answer})
+            yield face_answer
             return
 
         # Pre-LLM camera check: if user asks to take a photo / look at something,
