@@ -3,7 +3,7 @@ import logging
 import os
 import re
 import json
-from .config import PIPER_CMD, PIPER_MODEL  # ALSA_DEVICE imported lazily inside play_audio_on_hardware
+from .config import PIPER_CMD, PIPER_MODEL, PIPER_SAMPLE_RATE  # ALSA_DEVICE imported lazily inside play_audio_on_hardware
 
 logger = logging.getLogger(__name__)
 
@@ -132,7 +132,7 @@ def play_audio_on_hardware(text: str):
             temp_text_path = tf.name
 
         try:
-            piper_cmd = f"cat {temp_text_path} | {PIPER_CMD} --model {PIPER_MODEL} --output_raw | aplay -D {ALSA_DEVICE} -r 22050 -f S16_LE -t raw --buffer-time=500000"
+            piper_cmd = f"cat {temp_text_path} | {PIPER_CMD} --model {PIPER_MODEL} --output_raw | aplay -D {ALSA_DEVICE} -r {PIPER_SAMPLE_RATE} -f S16_LE -t raw --buffer-time=500000"
             
             # Retry loop for busy audio device
             for attempt in range(5):

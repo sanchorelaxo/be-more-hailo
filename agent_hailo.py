@@ -48,7 +48,7 @@ from core.timer_chips import TimerChips
 from core.briefing.settings import load_briefing_settings, update_settings
 from core.briefing.scheduler import BriefingScheduler, prepare_briefing
 from core.briefing import ui as briefing_ui
-from core.config import LLM_KEEP_ALIVE, MIC_DEVICE_INDEX, MIC_SAMPLE_RATE, WAKE_WORD_MODEL, WAKE_WORD_THRESHOLD, ALSA_DEVICE, VOLUME
+from core.config import LLM_KEEP_ALIVE, MIC_DEVICE_INDEX, MIC_SAMPLE_RATE, WAKE_WORD_MODEL, WAKE_WORD_THRESHOLD, ALSA_DEVICE, VOLUME, PIPER_SAMPLE_RATE
 
 # Live face rig (bmo_face/): morphs the artwork instead of flipping PNG frames.
 # Set BMO_FACE_RIG=0 to go back to the PNG faces; any load error does the same.
@@ -358,7 +358,7 @@ class BotGUI:
         if USE_FACE_RIG:
             try:
                 self.face_view = FaceView(self.background_label, size=(self.BG_WIDTH, self.BG_HEIGHT))
-                self._lip_sync = LipSync(22050)
+                self._lip_sync = LipSync(PIPER_SAMPLE_RATE)
                 print("[FACE] Live face rig enabled")
             except Exception as e:
                 print(f"[FACE] Rig failed to start, using PNG faces: {e}")
@@ -2089,7 +2089,7 @@ class BotGUI:
                 pass
 
         # Start aplay (retry on busy ALSA device)
-        aplay_cmd = ["aplay", "-D", ALSA_DEVICE, "-r", "22050", "-f", "S16_LE",
+        aplay_cmd = ["aplay", "-D", ALSA_DEVICE, "-r", str(PIPER_SAMPLE_RATE), "-f", "S16_LE",
                      "-t", "raw", "-q", "--buffer-time=500000"]
         for attempt in range(10):
             try:
@@ -2151,7 +2151,7 @@ class BotGUI:
     def _piper_to_aplay_loop(self):
         """Read Piper's raw PCM output and stream it into aplay with lip-sync."""
         chunk_size = 512  # samples (~23 ms at 22050 Hz)
-        sample_rate = 22050
+        sample_rate = PIPER_SAMPLE_RATE
         samples_written = 0  # drives each chunk's playback offset for lip-sync
         exit_reason = "unknown"
 

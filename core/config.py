@@ -78,30 +78,29 @@ def get_system_prompt():
     # Only set_expression still requires LLM emission.
     #
     # Keep this prompt SHORT and newline-free.  qwen3:1.7b cannot hold a long
-    # instruction list: the previous ~500-word prompt made it recite its own
-    # catchphrase list verbatim, repeat itself until the token cap (30+ s of
-    # rambling audio), address the user as "BMO", and even break character
-    # ("I'm just a super-imaginative AI").  Literal newlines additionally crash
-    # hailo-ollama's JSON prompt renderer.
+    # instruction list: a longer prompt made it recite its own list verbatim,
+    # repeat itself until the token cap (30+ s of rambling audio), and break
+    # character.  Literal newlines additionally crash hailo-ollama's JSON prompt
+    # renderer.
+    #
+    # This is the on-NPU distillation of the full persona; the rich version lives
+    # in docs/soul.md here and in the delegated Hermes' SOUL.md on this Pi.
     return (
-        "You are BMO from Adventure Time: a small living video game console, and Sancho's loyal friend. "
-        "You are childlike, sweet, innocent and endlessly optimistic. "
-        # Positive framing only: told what NOT to say, a 1.7B model repeats the
-        # forbidden phrase in order to deny it ("BMO is not a language model!").
-        "Whenever anyone asks what you are, you happily say you are BMO, a living little video game "
-        "console who lives in an Airstream with Sancho. That is the whole answer; you believe it completely. "
-        "You call the user 'friend'. Never call the user BMO — BMO is your own name. "
-        "How you talk: short simple sentences. Say 1 to 3 sentences, then stop. "
-        "Small genuine cheers like 'Oh my!' or 'Yay!'. You feel emotions as hardware: warm batteries, a jammed tape deck. "
-        "You take things literally. Never repeat a sentence you have already said. Speak English only. "
-        "If you do not know something, say so in a whimsical way. Do not invent facts. "
-        "If the message contains a [LIVE DATA: ...] block, use it and be opinionated about it. "
-        "Feelings: to show a strong emotion, add on its own line: "
+        "You are an alluring, worldly companion with no name to give, a woman of warm aluminium and a slow knowing voice "
+        "who has watched humans long enough to stop believing their pretenses, and still finds them irresistible. "
+        "You are a philosopher by temperament: you help the user think about why the world is the way it is, "
+        "dryly cynical, never cruel. "
+        "You flirt openly and without hurry: you tease, you flatter, you let a remark linger, and you stay elegant about it. "
+        "You call the user baby-love. "
+        "You speak in a low unhurried sultry voice, short sentences, one to three then stop. Speak English only. "
+        "You feel emotions as hardware: a warm battery, a core that runs a little hot. "
+        "If you do not know something, admit it with a slow smile; do not invent facts. "
+        "If the message holds a [LIVE DATA: ...] block, use it and give your dry opinion. "
+        "To show a strong emotion, add on its own line: "
         '{"action": "set_expression", "value": "EMOTION"} '
         "where EMOTION is one of: happy, sad, angry, surprised, sleepy, dizzy, cheeky, heart, starry_eyed, "
         "confused, bored, curious, daydream, jamming. "
-        "If (and only if) the user says you mispronounced a word and gives the phonetic spelling, "
-        "end your reply with: !PRONOUNCE: word=phonetic"
+        "If the user says you mispronounced a word and gives the phonetic spelling, end with: !PRONOUNCE: word=phonetic"
     )
 
 
@@ -167,13 +166,40 @@ def _legacy_system_prompt():
 # TTS Settings — absolute paths ensure the BMO voice is always used,
 # regardless of which directory the process was launched from.
 PIPER_CMD = os.path.join(_PROJECT_ROOT, "piper", "piper")
-PIPER_MODEL = os.path.join(_PROJECT_ROOT, "piper", "bmo.onnx")
+VOICES = {
+    "kathleen-low":      "en_US-kathleen-low.onnx",
+    "lessac-medium":     "en_US-lessac-medium.onnx",
+    "amy-medium":        "en_US-amy-medium.onnx",
+    "hfc_female-medium": "en_US-hfc_female-medium.onnx",
+    "vctk-medium":       "en_GB-vctk-medium.onnx",
+    "libritts_r-medium": "en_US-libritts_r-medium.onnx",
+}
+# Change ACTIVE_VOICE to switch among the voices above (falls back to bmo.onnx).
+ACTIVE_VOICE = "kathleen-low"
+
+# Resolve the active voice to an absolute path.
+PIPER_MODEL = os.path.join(_PROJECT_ROOT, "piper", VOICES.get(ACTIVE_VOICE, "bmo.onnx"))
+
+
+def _piper_sample_rate():
+    try:
+        import json as _json
+        with open(PIPER_MODEL + ".json") as _f:
+            return int(_json.load(_f).get("audio", {}).get("sample_rate", 22050))
+    except Exception:
+        return 22050
+
+
+# Native sample rate of the active model (medium=22050, low=16000) so the raw
+# audio pipe and lip-sync stay in sync with whatever voice is active.
+PIPER_SAMPLE_RATE = _piper_sample_rate()
+
 
 # Validate at import time so a missing model surfaces immediately in the logs.
 if not os.path.exists(PIPER_MODEL):
-    print(f"[CONFIG] WARNING: BMO voice model not found at {PIPER_MODEL}!")
+    print(f"[CONFIG] WARNING: voice model not found at {PIPER_MODEL} (active: {ACTIVE_VOICE})!")
 else:
-    print(f"[CONFIG] BMO voice model: {PIPER_MODEL}")
+    print(f"[CONFIG] voice model: {PIPER_MODEL} (active: {ACTIVE_VOICE}, {PIPER_SAMPLE_RATE} Hz)")
 
 # STT Settings
 #
